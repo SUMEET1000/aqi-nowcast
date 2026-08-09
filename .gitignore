@@ -22,6 +22,25 @@ venv/
 # content — regenerate with /graphify rather than committing it.
 graphify-out/
 
+# ---------------------------------------------------------------------------
+# AI-agent working files. NEVER PUBLISH THESE.
+#
+# This repo is a public portfolio piece. What belongs in it is the system —
+# the pipeline, the schema, the gates. What does not belong in it is the
+# scaffolding used to build it, or private notes about the person building it.
+#
+#   .claude/    agent instructions, and the build plan, which carries personal
+#               career context (placement timing, other projects, risk notes)
+#   CLAUDE.md   agent operating instructions for this repo
+#   IDEAS.md    the scope-creep parking lot — unbuilt ideas, not deliverables
+#
+# These stay on disk and are still the authority for how the project is built.
+# They are simply not part of what is published.
+# ---------------------------------------------------------------------------
+.claude/
+CLAUDE.md
+IDEAS.md
+
 # OS / editor
 .DS_Store
 Thumbs.db
