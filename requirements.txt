@@ -1,0 +1,11 @@
+# The project's only runtime dependency. Everything else is stdlib on purpose
+# (build plan §0.6 — ask before adding a dependency).
+#
+# psycopg 3, not psycopg2: current and maintained rather than in maintenance
+# mode. The [binary] extra ships a prebuilt wheel, so installing needs no C
+# compiler — without it, `pip install` on Windows fails with compiler errors.
+#
+# Pinned exactly. GitHub Actions installs this frozen; an unpinned driver that
+# silently upgrades mid-season is an outage in a pipeline whose whole value is
+# uninterrupted uptime.
+psycopg[binary]==3.3.4
