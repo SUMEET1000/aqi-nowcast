@@ -48,6 +48,43 @@ jobs:
       - name: Install frozen dependencies
         run: pip install -r requirements.txt
 
+      # Fail fast, and say WHICH credential is wrong. Without this the job just
+      # exits 1 from inside ingest.py with no fetch_log row written, and the two
+      # possible causes (missing API key vs unreachable database) are
+      # indistinguishable from the outside. A pipeline whose whole value is
+      # uninterrupted uptime has to name its own failure.
+      #
+      # Values are never printed — only presence, length, and shape. GitHub
+      # masks registered secrets in logs anyway, but this log is public, so the
+      # code does not rely on that.
+      - name: Preflight — check secrets are present and well-formed
+        env:
+          DATA_GOV_IN_API_KEY: ${{ secrets.DATA_GOV_IN_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          status=0
+          if [ -z "$DATA_GOV_IN_API_KEY" ]; then
+            echo "::error::DATA_GOV_IN_API_KEY is empty. Add it under Settings -> Secrets and variables -> Actions -> Repository secrets (not Variables, not Environment)."
+            status=1
+          else
+            echo "DATA_GOV_IN_API_KEY: present (${#DATA_GOV_IN_API_KEY} chars)"
+          fi
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL is empty. Add it under Settings -> Secrets and variables -> Actions -> Repository secrets (not Variables, not Environment)."
+            status=1
+          else
+            echo "DATABASE_URL: present (${#DATABASE_URL} chars)"
+            case "$DATABASE_URL" in
+              postgres://*|postgresql://*) echo "  scheme: ok" ;;
+              *) echo "::error::DATABASE_URL does not start with postgres:// or postgresql:// — it was probably truncated or the wrong field was copied."; status=1 ;;
+            esac
+            case "$DATABASE_URL" in
+              *sslmode=require*) echo "  sslmode=require: ok" ;;
+              *) echo "::warning::DATABASE_URL has no sslmode=require — Neon may refuse the connection." ;;
+            esac
+          fi
+          exit $status
+
       - name: Ingest
         env:
           # Entered by a human in Settings -> Secrets and variables -> Actions.
