@@ -19,6 +19,17 @@ MIN_SUCCESS_RATE = 0.95  # build plan §4
 # so that identical readings can be recognised as a pipeline bug, not weather.
 SEED_STATIONS = ("Patti Mehar, Ambala - HSPCB", "Sector-7, Kurukshetra - HSPCB")
 
+# Below this many readings the distinctness checks in check_seed_stations are
+# not evidence of anything and must not be reported as failures.
+#
+# Measured on the very first bulletin: Ambala and Kurukshetra both reported
+# value_avg = 48.0 (their min/max were 26/67 and 40/56, so plainly different
+# sensors). PM2.5 averages are small integers, so at n=1 a collision is likely
+# rather than surprising — but across 72 bulletins an identical series is
+# impossible by chance. A false "pipeline bug, not weather" alarm would send
+# someone hunting a bug that does not exist, so the check waits for a sample.
+MIN_READINGS_FOR_DISTINCTNESS = 12
+
 failures: list[str] = []
 
 
@@ -170,16 +181,27 @@ def check_seed_stations(cur) -> None:
 
     for name in SEED_STATIONS:
         if name not in got:
+            # This one IS a failure at any sample size: no rows at all means
+            # the testers pinned to this station would receive nothing.
             fail(f"seed station {name!r} has no PM2.5 rows — testers get nothing")
             continue
         n, distinct = got[name]
-        if distinct <= 1:
+        if n < MIN_READINGS_FOR_DISTINCTNESS:
+            print(f"  SKIP  {name!r}: only {n} reading(s), need "
+                  f"{MIN_READINGS_FOR_DISTINCTNESS} before 'unchanging' means anything")
+        elif distinct <= 1:
             fail(f"{name!r}: {n} readings but only {distinct} distinct value(s) — "
                  "a station that never changes is a dead sensor or a stuck pipeline")
         else:
             ok(f"{name!r}: {n} readings, {distinct} distinct values")
 
-    if len(got) == 2:
+    enough = all(got.get(s, (0, 0))[0] >= MIN_READINGS_FOR_DISTINCTNESS
+                 for s in SEED_STATIONS)
+    if len(got) == 2 and not enough:
+        print(f"  SKIP  identical-series check: needs "
+              f"{MIN_READINGS_FOR_DISTINCTNESS}+ readings per station. Two stations "
+              "sharing one integer average is a coincidence, not evidence.")
+    elif len(got) == 2:
         cur.execute(
             """
             SELECT count(*) FROM (

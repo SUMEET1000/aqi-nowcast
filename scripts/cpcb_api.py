@@ -18,6 +18,14 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+# Windows consoles default to cp1252, which renders the '§' and '—' in these
+# scripts' output as '?'. Gate output is meant to be readable (and screenshot-
+# able) evidence, so force UTF-8. Done here because every entry point imports
+# this module; the alternative is repeating it in six files.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 RESOURCE = "3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"
 BASE = f"https://api.data.gov.in/resource/{RESOURCE}"
 
