@@ -135,8 +135,13 @@ Stated here rather than discovered by a reader.
   ingester runs every 30 minutes to absorb that, and `gate1_check.py` reports missing hours.
 - **GitHub disables scheduled workflows on a repo with 60 days of no commits.** A dormant repo
   silently stops collecting.
-- Neon's free tier is 0.5 GB. At 30 stations × 7 pollutants that is roughly a year before old
-  data needs aggregating.
+- Neon's free tier is 0.5 GB storage and **100 CU-hours of compute per month**. At 30 stations ×
+  7 pollutants, storage is roughly a year before old data needs aggregating. Compute is the
+  tighter-looking constraint but is not close: the compute suspends after 5 minutes idle (not
+  disableable), and 48 runs/day spaced 30 minutes apart never overlap their 5-minute windows, so
+  usage is ~4 h/day → ~31 of the 100 CU-hours. Worth watching rather than worrying about —
+  **exceeding it suspends the database until the next billing period**, which would be days of
+  silent data loss rather than a slowdown.
 
 **Product**
 - Telegram has a smaller India install base than WhatsApp. Chosen because the WhatsApp Business
