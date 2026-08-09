@@ -1,0 +1,70 @@
+# The Phase 1 ingester. The most important file in the repo: every bulletin it
+# misses is training data that can never be recovered (build plan §4).
+#
+# Build plan §4 forbids running this inside a web dyno — a free web service
+# sleeps after 15 minutes idle and its cron dies silently. GitHub Actions runs
+# on GitHub's machines and has no such thing to sleep.
+name: ingest
+
+on:
+  # Every 30 minutes, offset off the hour.
+  #
+  # WHY 30 MINUTES when CPCB publishes hourly: GitHub's scheduled runs are
+  # best-effort. Under load they are delayed 15+ minutes and are occasionally
+  # skipped outright. Running twice per hour means a delayed run still catches
+  # the bulletin. The extra run costs nothing — observations is keyed on the
+  # bulletin timestamp, so a repeat is an upsert that changes nothing.
+  #
+  # WHY :05 AND :35 rather than :00 — the top of the hour is GitHub's most
+  # congested slot and the most likely to be delayed.
+  schedule:
+    - cron: '5,35 * * * *'
+
+  # So the job can be fired by hand from the Actions tab without waiting for a
+  # tick. Used to prove the pipeline works before the 72-hour Gate 1 clock.
+  workflow_dispatch:
+
+# If a run overruns, do not let the next tick pile a second one on top.
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned to match local. This machine has Python 3.13 as `python` and
+          # 3.14 as `python3`; leaving the version unpinned here is how a cron
+          # ends up on a different interpreter than anything ever tested.
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install frozen dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ingest
+        env:
+          # Entered by a human in Settings -> Secrets and variables -> Actions.
+          # Never printed by the code: scripts/db.py redacts anything
+          # password-shaped before it reaches this log, because Actions logs on
+          # a public repo are public.
+          DATA_GOV_IN_API_KEY: ${{ secrets.DATA_GOV_IN_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/ingest.py
+
+# Two GitHub behaviours designed around rather than discovered later:
+#
+#  1. GitHub DISABLES scheduled workflows on a repository with 60 days of no
+#     commits. A dormant repo silently stops collecting. Push something, or
+#     re-enable it from the Actions tab.
+#
+#  2. GitHub emails you when a run FAILS. It tells you nothing when a scheduled
+#     run is SKIPPED. That blind spot is what the missing-hour query in
+#     scripts/gate1_check.py exists to catch, and what Phase 5 monitoring is
+#     for.

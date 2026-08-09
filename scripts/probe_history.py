@@ -24,7 +24,14 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-from probe_cpcb import HEADERS, IST, fetch as fetch_cpcb, load_key as load_cpcb_key
+from cpcb_api import (
+    HEADERS,
+    IST,
+    FetchError,
+    fetch as fetch_cpcb,
+    load_key as load_cpcb_key,
+    require_env,
+)
 
 OPENAQ = "https://api.openaq.org/v3"
 # Haryana bounding box: minLon, minLat, maxLon, maxLat
@@ -45,19 +52,10 @@ MANUAL_MAP = {
 
 
 def load_openaq_key() -> str:
-    key = os.environ.get("OPENAQ_API_KEY")
-    if not key:
-        env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-        if os.path.exists(env_path):
-            with open(env_path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line.startswith("OPENAQ_API_KEY=") and "=" in line:
-                        key = line.split("=", 1)[1].strip().strip("\"'")
-                        break
-    if not key:
-        sys.exit("OPENAQ_API_KEY is not set. Put it in .env (see .env.example).")
-    return key
+    return require_env(
+        "OPENAQ_API_KEY",
+        "Free key from openaq.org. It goes in an X-API-Key header, not a query param.",
+    )
 
 
 _last_call = 0.0
@@ -315,7 +313,10 @@ def main() -> int:
     ap.add_argument("--write-doc", action="store_true")
     args = ap.parse_args()
 
-    records = fetch_cpcb(args.state, load_cpcb_key())
+    try:
+        records = fetch_cpcb(args.state, load_cpcb_key())
+    except FetchError as e:
+        sys.exit(str(e))
     cpcb_rows = {r["station"]: r for r in records}
     print(f"CPCB: {len(cpcb_rows)} live stations in {args.state}")
 

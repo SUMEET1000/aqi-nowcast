@@ -11,105 +11,25 @@ Also regenerates docs/stations.md. Stdlib only — no dependencies.
 """
 
 import argparse
-import json
 import os
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-RESOURCE = "3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"
-BASE = f"https://api.data.gov.in/resource/{RESOURCE}"
-
-# data.gov.in silently HANGS on requests with urllib's default User-Agent —
-# no response, no error, just a read timeout after 45s+. The identical request
-# with any ordinary UA returns in ~0.4s. Measured 2026-08-09. Do not remove:
-# in the Phase 1 hourly cron this presents as a random ingestion failure.
-HEADERS = {"User-Agent": "aqi-nowcast/0.1 (portfolio project; contact via repo)"}
-
-# The API stamps every row with the same bulletin time in IST and carries no
-# timezone marker. See docs/stations.md "Correction 2".
-IST = timezone(timedelta(hours=5, minutes=30))
+# Shared with the Phase 1 ingester. Everything in cpcb_api was learned here in
+# Phase 0; it was moved out so scripts/ingest.py does not import a throwaway.
+from cpcb_api import (
+    IST,
+    NULL_SENTINEL,
+    FetchError,
+    fetch,
+    load_key,
+    parse_bulletin_ts,
+    parse_value,
+)
 
 FRESH_HOURS = 3
 MIN_FRESH_STATIONS = 3
-NULL_SENTINEL = "NA"  # see Correction 3
-
-
-def load_key() -> str:
-    """Read the API key from .env or the environment. Never printed."""
-    key = os.environ.get("DATA_GOV_IN_API_KEY")
-    if not key:
-        env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-        if os.path.exists(env_path):
-            with open(env_path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line.startswith("DATA_GOV_IN_API_KEY=") and "=" in line:
-                        key = line.split("=", 1)[1].strip().strip("\"'")
-                        break
-    if not key:
-        sys.exit(
-            "DATA_GOV_IN_API_KEY is not set. Put it in .env (see .env.example).\n"
-            "Get a personal key from data.gov.in -> My Account -> API Key."
-        )
-    return key
-
-
-def fetch(state: str, key: str, limit: int = 1000) -> list[dict]:
-    params = {
-        "api-key": key,
-        "format": "json",  # without this the API returns XML
-        "limit": str(limit),  # defaults to 10; 500+ rows exist nationally
-        "filters[state]": state,
-    }
-    url = f"{BASE}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers=HEADERS)
-
-    # data.gov.in intermittently drops the TLS handshake — observed 3 times in
-    # one Phase 0 session, ~1 in 4 calls. Retried, not swallowed (§0.5): the
-    # attempt is logged, and exhausting retries is a hard failure. In Phase 1
-    # this same behaviour is what fetch_log.outcome='http_error' exists to count.
-    payload = None
-    for attempt in range(1, 4):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                if resp.status != 200:
-                    sys.exit(f"HTTP {resp.status} from data.gov.in")
-                payload = json.load(resp)
-            break
-        except (urllib.error.URLError, TimeoutError) as e:
-            print(f"  data.gov.in transient failure ({type(e).__name__}), "
-                  f"attempt {attempt}/3", file=sys.stderr)
-            if attempt == 3:
-                sys.exit(f"data.gov.in unreachable after 3 attempts: {e}")
-            time.sleep(2 ** attempt)
-
-    if payload.get("status") != "ok":
-        sys.exit(f"API returned status={payload.get('status')!r}: {payload.get('message')!r}")
-
-    records = payload.get("records", [])
-    # No silent fallbacks (§0.5): an empty result is a hard stop, not a warning.
-    if not records:
-        sys.exit(f"Zero records for state={state!r}. Widen to NCR before giving up.")
-    if len(records) >= limit:
-        sys.exit(f"Hit the limit ({limit}) — raise it, results are being truncated.")
-    return records
-
-
-def parse_value(raw: str) -> float | None:
-    """Map the 'NA' sentinel to None. Never coerce it to 0."""
-    if raw is None or raw.strip() == NULL_SENTINEL or raw.strip() == "":
-        return None
-    return float(raw)
-
-
-def parse_bulletin_ts(raw: str) -> datetime:
-    """last_update is 'DD-MM-YYYY HH:MM:SS' in IST, with no timezone marker."""
-    return datetime.strptime(raw, "%d-%m-%Y %H:%M:%S").replace(tzinfo=IST)
 
 
 def analyse(records: list[dict]) -> dict:
@@ -268,7 +188,13 @@ def main() -> int:
     ap.add_argument("--write-doc", action="store_true")
     args = ap.parse_args()
 
-    records = fetch(args.state, load_key())
+    # cpcb_api.fetch raises rather than exiting, so the ingester can write a
+    # fetch_log row before dying. A probe has nowhere to log, so it just exits.
+    try:
+        records = fetch(args.state, load_key())
+    except FetchError as e:
+        sys.exit(f"{e}\nWiden to NCR before concluding there is no data source.")
+
     a = analyse(records)
 
     print(f"state={args.state}  rows={len(records)}  stations={len(a['rows'])}")
