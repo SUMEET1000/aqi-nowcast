@@ -1,0 +1,27 @@
+# Secrets — never commit
+.env
+.env.local
+
+# Real people's names + contact channels (Gate 0.3).
+# Health-adjacent product: do not publish these in a public repo.
+# The committed structure lives in docs/distribution.example.md
+docs/distribution.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Probe output / scratch
+*.tmp
+.ipynb_checkpoints/
+
+# graphify knowledge-graph output. Generated, and graph.json embeds file
+# content — regenerate with /graphify rather than committing it.
+graphify-out/
+
+# OS / editor
+.DS_Store
+Thumbs.db
