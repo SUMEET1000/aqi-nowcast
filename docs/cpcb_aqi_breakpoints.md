@@ -100,22 +100,115 @@ For reference, at the 2026-08-09 probe: Ambala 49 (Satisfactory), Kurukshetra 48
 
 ---
 
-## ⚠ OPEN ITEM — blocking Phase 2, not Phase 0
+## CPCB health-advisory text — VERBATIM (captured 2026-08-10)
 
-**The verbatim CPCB health-advisory text for each band is NOT yet captured.**
+This section closes the open item that blocked Phase 2. §5 requires: *"Advisory text is quoted
+from CPCB's own published AQI advisory bands. We do not write our own medical guidance. Health
+advice is a liability surface."* Everything below is CPCB's own wording, transcribed from
+CPCB's own PDFs, with the source and page cited. **Nothing here is paraphrased. Do not
+"improve" the wording, fix its grammar, or shorten it — the quote is the liability shield.**
 
-§5 requires: *"Advisory text is quoted from CPCB's own published AQI advisory bands. We do not
-write our own medical guidance. Health advice is a liability surface."*
+> **Correction to the earlier note in this file.** It claimed the text was locked inside
+> *scanned* CPCB PDFs. That was wrong. Only the front matter (the Chairman's covering letter)
+> is a scan; the body is born-digital text — `About_AQI.pdf` is stamped *"Microsoft Word 2016"*
+> — merely FlateDecode-compressed, which is why naive fetching returned binary. `pdftotext`
+> reads it cleanly. The blocker was a tooling gap, not a source problem.
 
-Only paraphrases were obtainable from text sources; the authoritative table is inside scanned
-CPCB PDFs that could not be parsed without adding a dependency (§0.6). The substance is
-consistent across sources — Good "minimal impact" through Severe "affects healthy people,
-serious impacts for those with existing disease" — but **substance is not a quote, and
-paraphrased medical guidance is exactly the liability §5 forbids.**
+### CPCB publishes TWO different wordings. Both are official.
 
-Before Phase 2 ships any advisory string, obtain the exact wording from CPCB's
-"Broad Guidelines for Public" / AQI report and paste it verbatim into this file with the page
-cited. Until then the `profiles` table advisory column has no approved source text.
+This was not expected and it is a real Phase 2 decision, not a formatting detail.
+
+#### Source A — the canonical scheme document (long form)
+
+**Table 3.12 "Health Statements for AQI Categories", printed page 36** (PDF page 38) of CPCB's
+National Air Quality Index report — foreword by Shashi Shekhar, IAS, Chairman, CPCB, Ministry
+of Environment, Forest & Climate Change; scheme launched in draft October 2014, PDF issued
+2015-06-22. CPCB's NAQI page links it as **"Report on AQI"**:
+`https://cpcb.gov.in/displaypdf.php?id=bmF0aW9uYWwtYWlyLXF1YWxpdHktaW5kZXgvRklOQUwtUkVQT1JUX0FRSV8ucGRm`
+
+| AQI | Associated Health Impacts |
+|---|---|
+| Good (0–50) | Minimal Impact |
+| Satisfactory (51–100) | May cause minor breathing discomfort to sensitive people |
+| Moderate (101–200) | May cause breathing discomfort to the people with lung disease such as asthma and discomfort to people with heart disease, children and older adults |
+| Poor (201–300) | May cause breathing discomfort to people on prolonged exposure and discomfort to people with heart disease with short exposure |
+| Very Poor (301–400) | May cause respiratory illness to the people on prolonged exposure. Effect may be more pronounced in people with lung and heart diseases |
+| Severe (401-500) | May cause respiratory effects even on healthy people and serious health impacts on people with lung/heart diseases. The health impacts may be experienced even during light physical activity |
+
+Note the table's category label is **"Moderate"**, while the same document's narrative calls the
+band "Moderately polluted". Both are CPCB's.
+
+#### Source B — the daily AQI Bulletin (short form, and current)
+
+**"Health Statements for AQI Categories", page 13, column headed "Possible Health Impacts"** —
+CPCB Daily AQI Bulletin, 20 January 2025:
+`https://cpcb.nic.in/upload/Downloads/AQI_Bulletin_20250120.pdf`
+
+| AQI | Category | Possible Health Impacts |
+|---|---|---|
+| 0-50 | Good | Minimal Impact |
+| 51-100 | Satisfactory | Minor breathing discomfort to sensitive people |
+| 101-200 | Moderate | Breathing discomfort to the people with lungs, asthma and heart diseases |
+| 201-300 | Poor | Breathing discomfort to most people on prolonged exposure |
+| 301-400 | Very Poor | Respiratory illness on prolonged exposure |
+| 401-500 | Severe | Affects healthy people and seriously impacts those with existing diseases |
+
+**Recommendation for Phase 2, to be confirmed before any bot code:** use **Source B** as the
+`profiles` advisory text and cite it in the message. It is what CPCB publishes *every day*, so
+it is unambiguously current, and it fits a Telegram message. Keep Source A for a `/about`
+command where length is free. Whichever is chosen, the bot cites the document — never presents
+the sentence as ours.
+
+### Action guidance — only exists for Very Poor and Severe
+
+CPCB's §3.4 is *"Broad Guidelines for Actions during Very Poor and Severe Categories of AQI"*.
+There is **no per-band action advice** for Good through Poor; do not invent any to fill the
+table. The public-facing half, verbatim from the same report (printed pages 36–37):
+
+> People should maintain vehicles properly (e.g. get PUC checks, replace car air filter,
+> maintain right tires pressure), follow lane discipline and speed limits, avoid prolong idling
+> and turn off engines at red traffic signals. In addition, during severe or very poor AQI
+> categories, people should minimize travel; avoid using private vehicles and instead use public
+> transport, bikes or walk, and carpool; use smaller vehicles (e.g. avoid SUVs). The uses of
+> diesel generators should be minimized. People, especially those suffering from heart diseases
+> and asthma, may consider avoiding undue exposures.
+
+CPCB also publishes this standalone as **"Broad guidelines for Public"**
+(`https://cpcb.gov.in/displaypdf.php?id=bmF0aW9uYWwtYWlyLXF1YWxpdHktaW5kZXgvR3VpZGVsaW5lcy5wZGY=`),
+which is the same text with one typo — it reads `filter,maintainright tires pressure`. Two
+independent extractors reproduced that typo identically, so it is CPCB's, not ours. **If that
+document is ever quoted, quote the report's clean version instead and say why.**
+
+Note what this text mostly is: **civic advice about reducing emissions**, not personal health
+protection. The only sentence a subscriber can act on for their own health is the last one. The
+per-band *health statements* above, not this paragraph, are what the alert should carry.
+
+### ⚠ Still blocking, and it is a design question not a sourcing one
+
+**CPCB's advisory is keyed to the overall AQI band. Our product reports the PM2.5 sub-index
+band. These are not the same thing.**
+
+Overall AQI is the *worst* sub-index across ≥3 pollutants. Our band is PM2.5's sub-index alone.
+When PM2.5 dominates they coincide — usually true in NCR winter. When it does not, the true AQI
+band is **worse** than the band we show, so attaching CPCB's advisory to our PM2.5 band would
+**understate risk**, and would do it in the direction that matters.
+
+Phase 2 must resolve this before it ships a message. Do not paper over it by relabelling. The
+honest options, in order:
+
+1. Say what the number is: *"PM2.5 is 138 µg/m³ — Very Poor for PM2.5. Other pollutants are not
+   included, so the official AQI may be higher."* Quote the advisory for that band.
+2. Compute a real multi-pollutant AQI from our own logged 24h history once Phase 1 has ≥16h
+   across ≥3 pollutants (see the top of this file), and key the advisory off that.
+
+Option 1 ships now and is truthful; option 2 is better and needs the data Phase 1 is collecting.
+
+### Reproducing this capture
+
+Sources were read with `pdftotext -layout` (poppler). Poppler is a **system binary, installed on
+the dev machine — it is not a project dependency and `requirements.txt` is unchanged** (§0.6).
+Every quote above was verified twice: the text extraction matches a rendered image of the same
+page, and Sources A and B independently agree on substance while differing in wording.
 
 ## Attribution
 
