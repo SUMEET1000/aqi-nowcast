@@ -9,6 +9,7 @@ Read the comments before changing anything — several of these lines look
 optional and are not.
 """
 
+import http.client
 import json
 import os
 import sys
@@ -106,6 +107,21 @@ def fetch(state: str, key: str, limit: int = 1000) -> list[dict]:
     # against a Gate 1 threshold of 95%. The gate would then be decided by the
     # weather at data.gov.in rather than by whether our pipeline works.
     # 5 attempts puts it at 0.33^5 = 0.4%, i.e. ~99.6%.
+    #
+    # THE EXCEPT CLAUSE MUST STAY BROAD. It used to be
+    # `(urllib.error.URLError, TimeoutError)`, which does NOT cover a dropped
+    # TLS handshake — the exact failure the retry exists for. ssl.SSLError,
+    # ConnectionResetError and http.client.RemoteDisconnected are none of them
+    # URLError subclasses, so ONE TLS drop escaped this loop entirely, sailed
+    # past ingest.py's `except FetchError`, and killed the process with a
+    # traceback and no fetch_log row. That is the 2026-08-10 04:15 UTC failure:
+    # 5m34s of step time (4 timeouts + backoff, then a 5th attempt dying on
+    # TLS) and no trace in the database. The retry was never absorbing the
+    # failure mode it was sized for.
+    #
+    # OSError covers URLError, ssl.SSLError, ConnectionResetError and socket
+    # errors; HTTPException covers RemoteDisconnected and IncompleteRead.
+    # Between them that is every way this call fails for network reasons.
     payload = None
     for attempt in range(1, ATTEMPTS + 1):
         try:
@@ -114,7 +130,7 @@ def fetch(state: str, key: str, limit: int = 1000) -> list[dict]:
                     raise FetchError(f"HTTP {resp.status} from data.gov.in", resp.status)
                 payload = json.load(resp)
             break
-        except (urllib.error.URLError, TimeoutError) as e:
+        except (OSError, http.client.HTTPException) as e:
             print(f"  data.gov.in transient failure ({type(e).__name__}), "
                   f"attempt {attempt}/{ATTEMPTS}", file=sys.stderr)
             if attempt == ATTEMPTS:
