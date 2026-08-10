@@ -22,22 +22,50 @@ From CPCB, [How is AQI calculated?](https://airquality.cpcb.gov.in/ccr_docs/How_
 
 ### Consequence for this project — read before Phase 2
 
-**We cannot compute a CPCB-comparable AQI from a single API snapshot.** The live feed gives
-one reading per station per pollutant; a valid sub-index needs a 24h window with ≥16h of
-data. Three options, in order of honesty:
+These are **two separate decisions** and conflating them is what produced the blocker that
+sat at the end of this file for a day.
 
-- **Preferred: don't display "AQI" at all.** Show **PM2.5 in µg/m³** and the band it falls in.
-  This is also better product design — the whole point of §1 is that we are not an AQI
-  dashboard, and PM2.5 is the number the advisory actually keys off.
-- If AQI is displayed later, compute it from **our own logged 24h history** once Phase 1 has
-  ≥16h per station, and enforce the 3-pollutant / PM-required rule in code.
-- **Never** label a single-hour sub-index as "AQI". It will disagree with every other app and
-  §9's credibility argument collapses.
+**Decision 1 — the headline number is PM2.5 in µg/m³, and its band.** Not an AQI. §1's whole
+point is that we are not an AQI dashboard, and PM2.5 is the pollutant we forecast. This does
+not change.
 
-Also unresolved: it is **not documented whether the API's `avg_value` is an instantaneous
-reading or an average over some window.** Phase 1 should log enough to determine this
-empirically — if `avg_value` never changes faster than a 24h average plausibly could, it is
-already averaged. Do not assume either way.
+**Decision 2 — the CPCB advisory sentence is keyed to the OVERALL AQI band**, because that is
+the band CPCB wrote it against (fully specified in "Resolved" at the end of this file).
+Keying it to the PM2.5 band understates risk whenever PM2.5 is not the worst pollutant.
+
+Whether we can produce that overall AQI depends on one measurable fact, below.
+
+**Never** label a single-hour sub-index as "AQI". It will disagree with every other app and
+§9's credibility argument collapses.
+
+### Is `avg_value` already averaged? — measured, not yet settled
+
+It is **not documented whether the API's `avg_value` is an instantaneous reading or an average
+over some window**, and the answer decides Decision 2: if CPCB already ships the averages, the
+overall AQI is computable from a **single bulletin**; if not, we build the window ourselves out
+of `observations` and CPCB's ≥16h-of-24 rule becomes our problem.
+
+`scripts/probe_avg_window.py` measures it. Two tests, both of which assume `avg_value` is
+already averaged over CPCB's own period for that pollutant and then try to **disprove** it:
+
+- **A** — a running mean over `W` hours cannot move by more than `(max − min) / W` in one hour.
+- **B** — a recently published average must fall inside this row's `[min, max]`, because the
+  two windows overlap almost completely.
+
+**Status 2026-08-10: WITHHELD on sample size — 12 bulletins over 18h, the probe needs 24 over
+24h.** All seven pollutants provisionally read as **already averaged**, both tests agreeing.
+Corroborated by hand on the Ambala seed station: PM2.5 drifted 48 → 40 over 18h, never moving
+more than 1 µg/m³ in an hour, with `min`/`max` spanning 8–56 — a day's range, not an hour's.
+**Do not write this into the README as settled.** Re-run the probe when the sample is there;
+it exits 0 only when it reaches a verdict.
+
+Two things that probe got wrong at first, worth not repeating:
+
+- **O₃ and CO are 8-hourly, everything else 24-hourly** (see the breakpoint table below).
+  Testing all seven against 24h manufactured violations for the two 8-hourly ones.
+- **The published values are integers**, so two rounded averages can overstate a step by up to
+  1.0. Without that allowance the test flagged 14 PM2.5 pairs, every one of them a step of
+  exactly 1.0 against a sub-1.0 ceiling — the probe's arithmetic, not CPCB's data.
 
 ---
 
@@ -153,7 +181,7 @@ CPCB Daily AQI Bulletin, 20 January 2025:
 | 301-400 | Very Poor | Respiratory illness on prolonged exposure |
 | 401-500 | Severe | Affects healthy people and seriously impacts those with existing diseases |
 
-**Recommendation for Phase 2, to be confirmed before any bot code:** use **Source B** as the
+**Confirmed 2026-08-10 (was a recommendation):** use **Source B** as the
 `profiles` advisory text and cite it in the message. It is what CPCB publishes *every day*, so
 it is unambiguously current, and it fits a Telegram message. Keep Source A for a `/about`
 command where length is free. Whichever is chosen, the bot cites the document — never presents
@@ -183,25 +211,52 @@ Note what this text mostly is: **civic advice about reducing emissions**, not pe
 protection. The only sentence a subscriber can act on for their own health is the last one. The
 per-band *health statements* above, not this paragraph, are what the alert should carry.
 
-### ⚠ Still blocking, and it is a design question not a sourcing one
+### ✅ Resolved 2026-08-10 — the advisory is keyed to the overall AQI
 
-**CPCB's advisory is keyed to the overall AQI band. Our product reports the PM2.5 sub-index
-band. These are not the same thing.**
+**The problem.** CPCB's advisory is keyed to the overall AQI band — the *worst* sub-index
+across ≥3 pollutants. Our headline number is PM2.5's sub-index alone. When PM2.5 dominates they
+coincide (usually true in NCR winter); when it does not, the true AQI band is **worse** than the
+band we show, so attaching CPCB's advisory to our PM2.5 band would **understate risk**, in the
+direction that matters.
 
-Overall AQI is the *worst* sub-index across ≥3 pollutants. Our band is PM2.5's sub-index alone.
-When PM2.5 dominates they coincide — usually true in NCR winter. When it does not, the true AQI
-band is **worse** than the band we show, so attaching CPCB's advisory to our PM2.5 band would
-**understate risk**, and would do it in the direction that matters.
+**The decision.** The message leads with **PM2.5 in µg/m³ and its band** — that is the product —
+but the **CPCB advisory sentence is selected by the computed overall AQI band**. That removes
+the understatement rather than disclaiming it.
 
-Phase 2 must resolve this before it ships a message. Do not paper over it by relabelling. The
-honest options, in order:
+Note what this is *not*: we do not become an AQI dashboard. The overall AQI selects a sentence;
+it is not the headline, and §11's "no map, no city ranking, no current-AQI lookup" all still
+hold.
 
-1. Say what the number is: *"PM2.5 is 138 µg/m³ — Very Poor for PM2.5. Other pollutants are not
-   included, so the official AQI may be higher."* Quote the advisory for that band.
-2. Compute a real multi-pollutant AQI from our own logged 24h history once Phase 1 has ≥16h
-   across ≥3 pollutants (see the top of this file), and key the advisory off that.
+**What Phase 2 implements.** Nothing here needs re-deciding; it is all specified above.
 
-Option 1 ships now and is truthful; option 2 is better and needs the data Phase 1 is collecting.
+1. Per pollutant, compute the sub-index by piecewise-linear interpolation from the breakpoint
+   table, using the pollutant's own averaging period (24h; **8h for O₃ and CO**).
+2. **Clamp above the top breakpoint to index 500** — never extrapolate. Gurugram exceeds
+   250 µg/m³ PM2.5 routinely in November, so this path *will* be hit.
+3. Reproduce CPCB's worked examples exactly, as a test: PM2.5 31 → 51, 45 → 75, 60 → 100.
+4. **Overall AQI = max of the available sub-indices**, but only if **≥3 pollutants** are
+   available **and at least one of them is PM2.5 or PM10**. This is CPCB's rule, quoted at the
+   top of this file. Enforce it in code.
+5. Select the advisory sentence by that band. Use **Source B** (the daily-bulletin short form) —
+   it is what CPCB publishes every day and it fits a Telegram message. Source A goes in
+   `/about`, where length is free. Cite the document; never present the sentence as ours.
+
+**NULL handling — the one place a silent fallback would be most tempting and most wrong (§0.5).**
+`NA` becomes SQL NULL at ingest (Phase 0 found 7 per snapshot). A pollutant whose average is
+NULL contributes **no sub-index**. If that leaves fewer than 3 pollutants, or leaves neither
+PM2.5 nor PM10, then **no AQI is produced** — do not quietly compute one from what is left.
+
+**The degraded path, when no AQI can be produced.** Fall back to naming exactly what the number
+is, and say the official band may be worse:
+
+> *"PM2.5 is 138 µg/m³ — Very Poor for PM2.5. Other pollutants are not included, so the official
+> AQI may be higher."*
+
+This was the old "Option 1". It is now the **documented fallback**, not the primary design. How
+often it fires depends on the open measurement above: if CPCB already ships averaged values it
+should be rare, and if we have to build the 24h window ourselves it may be the common path —
+`probe_avg_window.py`'s Test C reports that fraction directly. **Settle that before writing the
+message templates**, because it decides which of these two wordings users mostly see.
 
 ### Reproducing this capture
 
