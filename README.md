@@ -153,6 +153,12 @@ Stated here rather than discovered by a reader.
   silent data loss rather than a slowdown.
 
 **Product**
+- Health advisory text is quoted verbatim from CPCB's published bands, never written here. But
+  CPCB writes it against the **overall** AQI — the worst sub-index across three or more
+  pollutants — while this service reports the **PM2.5** band. The two agree when PM2.5 is the
+  dominant pollutant, which is usually the case in NCR winter; when it is not, the official AQI
+  band is worse than the one shown. Alerts therefore state which number they are reporting
+  rather than implying an official AQI. See `docs/cpcb_aqi_breakpoints.md`.
 - Telegram has a smaller India install base than WhatsApp. Chosen because the WhatsApp Business
   API is neither free nor solo-friendly — a tradeoff, not an oversight.
 - Fixed thresholds fire constantly in November and never in July. Per-user cooldowns exist for
