@@ -1,0 +1,63 @@
+# Cloudflare Worker that fires the ingest workflow on schedule.
+#
+# WHY THIS EXISTS AT ALL. GitHub Actions' `schedule:` trigger is best-effort and
+# this repo is measurably throttled on it: over the first 18 hours of deployment
+# GitHub delivered 11 of ~36 requested ticks (31%), every one 15-22 minutes late,
+# with holes of 102-167 minutes. Not once in 18 hours did two ticks land in the
+# same hour. Moving the cron off the congested :05/:35 slots to :13/:43 changed
+# nothing and made the delay worse, which is what ruled out slot contention.
+#
+# The throttle is on GitHub's SCHEDULED-EVENT QUEUE, not on the repo's ability to
+# run jobs. Measured on the same 18 hours: all four `workflow_dispatch` runs
+# started 0 seconds after they were asked for, against 11 scheduled runs that
+# were never once on time. So an API trigger bypasses the thing that is broken.
+#
+# The GitHub cron in .github/workflows/ingest.yml is deliberately LEFT RUNNING as
+# a free backup and as a continuing control measurement. This Worker is the
+# primary trigger; that cron is the safety net if Cloudflare or the PAT fails.
+
+name = "aqi-nowcast-trigger"
+main = "src/index.js"
+compatibility_date = "2026-08-10"
+
+# No public URL. This Worker exports only `scheduled` — it has no `fetch`
+# handler, so an HTTP endpoint would serve nothing. Cron Triggers are invoked by
+# Cloudflare internally and need no route and no workers.dev subdomain.
+#
+# Without this, `wrangler deploy` assumes workers.dev publishing and hard-fails
+# with "You can either deploy your worker to one or more routes ... or register a
+# workers.dev subdomain".
+#
+# BUT THE ACCOUNT STILL NEEDS A workers.dev SUBDOMAIN TO EXIST. Setting this
+# false is not a way to avoid creating one. Cloudflare's schedules API refuses
+# with error 10063 ("You need a workers.dev subdomain in order to proceed") until
+# the account has one, so a cron-only Worker will upload fine and then silently
+# deploy no triggers at all — "No targets deployed", which reads like success if
+# you are not looking for the schedule line. Open Workers & Pages in the
+# dashboard once to create it, then re-deploy.
+#
+# The two are separate: the subdomain exists on the ACCOUNT; workers_dev = false
+# keeps THIS Worker off it. There is no reason to give a token-bearing trigger an
+# internet-facing address, and it has no `fetch` handler to serve one anyway.
+workers_dev = false
+
+# Observability on, so a failed dispatch is visible in the Cloudflare dashboard
+# rather than only in `wrangler tail` while someone happens to be watching.
+[observability]
+enabled = true
+
+[triggers]
+# :05 and :35 — twice an hour, which is what the GitHub cron was always asking
+# for and never getting. CPCB publishes hourly and each bulletin is on the feed
+# for about an hour, so the second run is the margin: it catches the bulletin if
+# the first one runs before CPCB has published it.
+#
+# WHY NOT HOURLY. Neon bills roughly 5 minutes of compute per wake regardless of
+# how short the run is, so cost scales with the NUMBER of runs — which is what
+# made this worth checking before choosing. Measured in the Neon console on
+# 2026-08-10: 0.78 of 100 CU-hours used since 2026-08-09. Twice-hourly plus the
+# GitHub cron backup projects to ~39 of 100. There is no cost argument for
+# running once an hour, and once an hour is actively risky: a bulletin stamped
+# H:30 appears on the feed anywhere from H+0:32 to H+1:04, so a single fixed
+# poll can sit in the wrong half of that drift and miss one entirely.
+crons = ["5,35 * * * *"]

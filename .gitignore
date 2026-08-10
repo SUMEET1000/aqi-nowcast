@@ -2,6 +2,14 @@
 .env
 .env.local
 
+# Cloudflare Wrangler (trigger/). `.dev.vars` is where wrangler puts secrets for
+# local runs — it would hold the GitHub PAT in plaintext. `.wrangler/` is local
+# state. Listed here BEFORE trigger/ was created, not after: this repo has
+# already published files it should not have once.
+.dev.vars
+.wrangler/
+node_modules/
+
 # Real people's names + contact channels (Gate 0.3).
 # Health-adjacent product: do not publish these in a public repo.
 # The committed structure lives in docs/distribution.example.md

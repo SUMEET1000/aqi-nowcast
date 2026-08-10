@@ -15,10 +15,9 @@ HOURS_REQUIRED = 60      # 72 hourly bulletins, minus 12h slack for GitHub delay
 MIN_STATIONS = 3         # build plan §4
 MIN_SUCCESS_RATE = 0.95  # build plan §4
 
-# Must match the cron in .github/workflows/ingest.yml ('13,43 * * * *'). Only
-# used to report what fraction of ticks GitHub actually delivered — never to
-# fail the gate. See check_delivery.
-TICKS_PER_HOUR = 2
+# Below this fraction of hours carrying at least one run, say so loudly.
+# Not a gate — check_gaps owns the pass/fail. See check_polling.
+MIN_HOURS_COVERED = 0.95
 
 # A run whose bulletin is older than this proves the national feed was frozen
 # over the span between them: CPCB normally publishes bulletin H:30 about an
@@ -140,43 +139,63 @@ def check_fetch_log(cur) -> None:
         for outcome, n in anomalies:
             print(f"      {outcome:<18} {n}")
 
-    check_delivery(cur, total)
+    check_polling(cur)
 
 
-def check_delivery(cur, recorded: int) -> None:
-    """How many of the ticks the cron asked for did GitHub actually deliver?
+def check_polling(cur) -> None:
+    """What fraction of hours had at least one run?
 
-    REPORTED, NEVER FAILED ON. GitHub dropping a scheduled tick is not our code
+    REPORTED, NEVER FAILED ON. A trigger dropping a tick is not our code
     failing, and check_gaps already owns the pass/fail on the consequence that
     matters (a bulletin we never captured). Failing here as well would fail the
     gate twice for one event, and for something we do not control.
 
-    Measured 2026-08-09/10: 8 of ~22 due ticks arrived, 4-23 min late, with
-    holes up to 3h32m — GitHub's schedule trigger is best-effort and says
-    nothing when it skips.
+    THIS USED TO BE A TICK-DELIVERY RATIO: recorded runs divided by a
+    TICKS_PER_HOUR constant pinned to the cron in ingest.yml. That constant no
+    longer has a correct value. Since 2026-08-10 there are two independent
+    triggers — the Cloudflare Worker in trigger/ and the GitHub cron kept on as
+    backup — so no single number describes what was 'due', and the old ratio
+    would misreport whatever it was set to. Do not reintroduce it.
 
-    APPROXIMATE. fetch_log cannot tell a scheduled run from a manual or local
-    one, so this over-counts deliveries by however many of those there were.
-    It is a smoke signal, not a measurement; the Actions API is the authority.
+    'At least one run per hour' is the property that actually matters and it
+    holds under any number of triggers: CPCB publishes hourly and each bulletin
+    is on the feed for about an hour, so one run an hour is the real floor.
+
+    Still approximate in one direction: fetch_log cannot tell a scheduled run
+    from a dispatched, manual, or local one, so a laptop run counts as coverage.
+    The Actions API is the authority on which trigger fired.
     """
     cur.execute(
         """
-        SELECT min(run_ts), max(run_ts) FROM fetch_log WHERE station_id IS NULL
+        WITH span AS (
+            SELECT date_trunc('hour', min(run_ts)) AS lo,
+                   date_trunc('hour', max(run_ts)) AS hi
+            FROM fetch_log WHERE station_id IS NULL
+        ),
+        expected AS (
+            SELECT generate_series(lo, hi, interval '1 hour') AS hour FROM span
+        )
+        SELECT count(*) FILTER (
+                   WHERE EXISTS (SELECT 1 FROM fetch_log f
+                                 WHERE f.station_id IS NULL
+                                   AND date_trunc('hour', f.run_ts) = e.hour)
+               ) AS covered,
+               count(*) AS total
+        FROM expected e
         """
     )
-    lo, hi = cur.fetchone()
-    hours = (hi - lo).total_seconds() / 3600
-    if hours < 1:
+    covered, total = cur.fetchone()
+    if not total or total < 2:
         return
 
-    expected = hours * TICKS_PER_HOUR
-    ratio = recorded / expected
-    print(f"    schedule delivery: {recorded} runs over {hours:.1f}h, "
-          f"~{expected:.0f} ticks due ({ratio:.0%})")
-    if ratio < 0.8:
-        print(f"    NOTE  GitHub delivered {ratio:.0%} of the cron's ticks. Not a "
-              "failure of ours, but it means the 30-minute cadence's margin is "
-              "gone and every delivered run is load-bearing.")
+    ratio = covered / total
+    print(f"    polling coverage: {covered}/{total} hours carried a run ({ratio:.0%})")
+    if ratio < MIN_HOURS_COVERED:
+        print(f"    NOTE  {total - covered} hour(s) had NO run at all. Not a failure "
+              "of ours, but each one is an hour in which a bulletin could only be "
+              "captured by luck. Check the Actions API for which trigger dropped, "
+              "and trigger/README.md for the known failure modes (an expired PAT "
+              "leaves the throttled GitHub cron as the only trigger).")
 
 
 def check_gaps(cur) -> None:

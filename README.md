@@ -37,16 +37,21 @@ distribution problem to the front while it can still change decisions.
 data.gov.in (CPCB hourly bulletin, 30 Haryana stations, 7 pollutants)
         │  snapshot only — no history, so it must be logged as it happens
         ▼
-GitHub Actions cron (:13 and :43)  ──▶  scripts/ingest.py  ──▶  Neon Postgres
-                                              │                    observations
-                                              │                    fetch_log
-                                              ▼                    stations
-                                        idempotent upsert
-                                    keyed on the bulletin timestamp
+Cloudflare Worker cron (:05, :35) ─┐
+        │  workflow_dispatch       ├─▶ GitHub Actions ─▶ scripts/ingest.py ─▶ Neon Postgres
+GitHub Actions cron (:13, :43) ────┘        job                  │              observations
+        │  backup, throttled                                     │              fetch_log
+                                                                 ▼              stations
+                                                          idempotent upsert
+                                                    keyed on the bulletin timestamp
 ```
 
 The ingester runs on GitHub Actions rather than inside a web service on purpose: a free web
 dyno sleeps after 15 minutes idle and its cron dies silently.
+
+**The trigger is external because GitHub's own one is throttled here.** GitHub Actions runs the
+job reliably; what it does not do reliably is *start* it on a schedule. See `trigger/` for the
+measurements and the setup.
 
 ---
 
@@ -75,7 +80,9 @@ python tests/test_null_guard.py  # prove a null can never erase a reading
 ```
 
 To run it unattended, push to GitHub and add `DATA_GOV_IN_API_KEY` and `DATABASE_URL` under
-Settings → Secrets and variables → Actions. The workflow then fires every 30 minutes.
+Settings → Secrets and variables → Actions. That alone gets you GitHub's own cron, which is
+throttled on a new repository — see [`trigger/`](trigger/) to add the external clock that
+actually fires on time.
 
 Gate commands (exit codes, not judgement calls):
 
@@ -126,17 +133,26 @@ Stated here rather than discovered by a reader.
   product.
 - Missing hours are common. Forward-filling beyond ~3 hours is fabrication; the cutoff will be
   documented and enforced in code, not left to judgement.
-- We **cannot** compute a CPCB-comparable AQI from the live snapshot — that needs a 24h window
-  with ≥16h of data across ≥3 pollutants. The product reports **PM2.5 in µg/m³ and its band**
-  instead. See `docs/cpcb_aqi_breakpoints.md`.
+- A CPCB-comparable AQI needs a 24h window (8h for O₃ and CO) with ≥16h of data across ≥3
+  pollutants, so it cannot come from one reading. Whether the API's `avg_value` is *already*
+  such an average — which would make it computable from a single bulletin — is **being measured
+  rather than assumed**: `scripts/probe_avg_window.py` tries to disprove it from the logged
+  history and reports per pollutant. As of 2026-08-10 it **withholds a verdict** on sample size
+  (12 bulletins; it wants 24 over 24h). Either way the headline number stays **PM2.5 in µg/m³
+  and its band**. See `docs/cpcb_aqi_breakpoints.md`.
 
 **Infrastructure**
-- GitHub's scheduled runs are best-effort: delayed under load, occasionally skipped. The
-  ingester runs every 30 minutes to absorb that, and `gate1_check.py` reports missing hours.
-  **Measured, not assumed:** over the first 11 hours of deployment GitHub delivered 8 of ~22
-  due ticks (36%), 4–23 minutes late, with gaps up to 3h32m — about one run per hour rather
-  than two. The offsets were moved off the congested `:05`/`:35` slots to `:13`/`:43` to test
-  whether that is slot contention or per-workflow throttling.
+- **GitHub's `schedule:` trigger is throttled on this repository, and the cron is not the
+  lever.** Measured over the first 18 hours from the public Actions API: 11 of ~36 requested
+  ticks delivered (31%), every one 15–22 minutes late, with holes of 102–167 minutes, and *not
+  once* did two ticks land in the same hour. Moving the offsets off the contended `:05`/`:35`
+  slots to `:13`/`:43` changed nothing and made the delay worse, which ruled out slot
+  contention. Over the same window all four `workflow_dispatch` runs started **0 seconds** after
+  being asked — the throttle is on the scheduled-event queue, not on the ability to run jobs.
+  The fix is an external clock (`trigger/`) calling the dispatch API, with GitHub's cron left
+  on as a free backup. Two bulletins survive in the database only because someone ran the
+  ingester by hand during a 157-minute hole; CPCB publishes no archive, so a hole that wide
+  loses data permanently.
 - A missing bulletin hour has two possible authors and they need different fixes.
   `gate1_check.py` separates them: a run that returns a bulletin more than 2 hours old proves
   CPCB's feed was frozen across that span (`feed_stalled`), and only the remaining hours
@@ -146,19 +162,28 @@ Stated here rather than discovered by a reader.
   silently stops collecting.
 - Neon's free tier is 0.5 GB storage and **100 CU-hours of compute per month**. At 30 stations ×
   7 pollutants, storage is roughly a year before old data needs aggregating. Compute is the
-  tighter-looking constraint but is not close: the compute suspends after 5 minutes idle (not
-  disableable), and 48 runs/day spaced 30 minutes apart never overlap their 5-minute windows, so
-  usage is ~4 h/day → ~31 of the 100 CU-hours. Worth watching rather than worrying about —
-  **exceeding it suspends the database until the next billing period**, which would be days of
-  silent data loss rather than a slowdown.
+  constraint that governs how often the ingester may run, because **Neon bills per wake, not
+  per second**: it suspends after 5 minutes idle (not disableable), so a 25-second run and a
+  4-minute run cost the same. Cost therefore scales with the *number* of runs.
+  - This README previously put usage at ~31 CU-hours. That was a **projection from 48 runs/day
+    that never happened** — GitHub was only delivering ~15. **Measured in the Neon console
+    2026-08-10: 0.78 of 100 CU-hours since 2026-08-09**, i.e. ~16/month at the old rate.
+  - With the external trigger at 2/hour plus GitHub's cron as backup, the worst case is ~63
+    runs/day with no overlap → ~5.25 h/day → **~39 of the 100 CU-hours**. Comfortable, but the
+    figure to watch, since **exceeding it suspends the database until the next billing period**
+    — days of silent data loss rather than a slowdown.
+  - This is also why the ingester is *not* built as one long-lived polling job. Polling every
+    few minutes inside a single run would multiply wakes, not amortise them, and would put
+    usage past the cap.
 
 **Product**
-- Health advisory text is quoted verbatim from CPCB's published bands, never written here. But
-  CPCB writes it against the **overall** AQI — the worst sub-index across three or more
-  pollutants — while this service reports the **PM2.5** band. The two agree when PM2.5 is the
-  dominant pollutant, which is usually the case in NCR winter; when it is not, the official AQI
-  band is worse than the one shown. Alerts therefore state which number they are reporting
-  rather than implying an official AQI. See `docs/cpcb_aqi_breakpoints.md`.
+- Health advisory text is quoted verbatim from CPCB's published bands, never written here. CPCB
+  writes it against the **overall** AQI — the worst sub-index across three or more pollutants —
+  while the headline number here is **PM2.5**. Those agree only while PM2.5 dominates, so
+  keying the advisory to the PM2.5 band would understate risk exactly when it matters. The
+  advisory is therefore selected by the **computed overall AQI band** while PM2.5 stays the
+  number shown. When CPCB's own ≥3-pollutant rule cannot be met, no AQI is computed and the
+  alert says so explicitly rather than guessing. See `docs/cpcb_aqi_breakpoints.md`.
 - Telegram has a smaller India install base than WhatsApp. Chosen because the WhatsApp Business
   API is neither free nor solo-friendly — a tradeoff, not an oversight.
 - Fixed thresholds fire constantly in November and never in July. Per-user cooldowns exist for
