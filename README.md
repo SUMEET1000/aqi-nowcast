@@ -37,7 +37,7 @@ distribution problem to the front while it can still change decisions.
 data.gov.in (CPCB hourly bulletin, 30 Haryana stations, 7 pollutants)
         │  snapshot only — no history, so it must be logged as it happens
         ▼
-GitHub Actions cron (:05 and :35)  ──▶  scripts/ingest.py  ──▶  Neon Postgres
+GitHub Actions cron (:13 and :43)  ──▶  scripts/ingest.py  ──▶  Neon Postgres
                                               │                    observations
                                               │                    fetch_log
                                               ▼                    stations
@@ -133,6 +133,15 @@ Stated here rather than discovered by a reader.
 **Infrastructure**
 - GitHub's scheduled runs are best-effort: delayed under load, occasionally skipped. The
   ingester runs every 30 minutes to absorb that, and `gate1_check.py` reports missing hours.
+  **Measured, not assumed:** over the first 11 hours of deployment GitHub delivered 8 of ~22
+  due ticks (36%), 4–23 minutes late, with gaps up to 3h32m — about one run per hour rather
+  than two. The offsets were moved off the congested `:05`/`:35` slots to `:13`/`:43` to test
+  whether that is slot contention or per-workflow throttling.
+- A missing bulletin hour has two possible authors and they need different fixes.
+  `gate1_check.py` separates them: a run that returns a bulletin more than 2 hours old proves
+  CPCB's feed was frozen across that span (`feed_stalled`), and only the remaining hours
+  (`not_polled`) count against the reliability budget. CPCB's feed froze for 7 hours overnight
+  on 2026-08-09/10 and published nothing; no polling cadence could have recovered those.
 - **GitHub disables scheduled workflows on a repo with 60 days of no commits.** A dormant repo
   silently stops collecting.
 - Neon's free tier is 0.5 GB storage and **100 CU-hours of compute per month**. At 30 stations ×
