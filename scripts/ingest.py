@@ -15,7 +15,7 @@ import sys
 from datetime import datetime, timezone
 
 from cpcb_api import FetchError, IST, fetch, load_key, parse_bulletin_ts, parse_value
-from db import connect
+from db import connect, redact
 
 STATE = "Haryana"
 
@@ -68,20 +68,45 @@ def previous_bulletin(conn) -> datetime | None:
 
 def main() -> int:
     key = load_key()
+
+    # -------------------------------------------------------------------
+    # Fetch BEFORE connecting, and hold the failure rather than handling it
+    # here. A failure is logged before the process dies, which is the entire
+    # reason cpcb_api.fetch raises instead of calling sys.exit.
+    #
+    # WHY: connect() used to run first, so the connection sat idle for the whole
+    # fetch — and a data.gov.in hang costs 330s (5 attempts x 60s + 30s
+    # backoff). Measured against Neon 2026-08-10: a connection idle for 334s
+    # SURVIVES if it is outside a transaction, but is terminated
+    # (IdleInTransactionSessionTimeout) if any query has opened one. The old
+    # code happened to be on the safe side of that line by accident — nothing
+    # queried before fetch(). Adding one SELECT above the fetch would have
+    # silently armed it.
+    #
+    # So this is hazard removal, not the fix for the 2026-08-10 04:15 UTC
+    # failure; that one was an uncaught TLS exception escaping cpcb_api.fetch's
+    # retry loop, fixed there. Do not move connect() back above fetch().
+    #
+    # Failing fast on a bad credential is not lost: the workflow's preflight
+    # step checks DATABASE_URL before ingest.py is invoked at all, and a
+    # healthy fetch takes ~0.4s locally.
+    # -------------------------------------------------------------------
+    fetch_error: FetchError | None = None
+    records: list[dict] = []
+    try:
+        records = fetch(STATE, key)
+    except FetchError as e:
+        fetch_error = e
+
     conn = connect()
     exit_code = 0
 
     try:
-        # ---------------------------------------------------------------
-        # Fetch. A failure here is logged before the process dies, which is
-        # the entire reason cpcb_api.fetch raises instead of calling sys.exit.
-        # ---------------------------------------------------------------
-        try:
-            records = fetch(STATE, key)
-        except FetchError as e:
-            log_row(conn, "http_error", http_status=e.http_status, error_detail=str(e))
+        if fetch_error is not None:
+            log_row(conn, "http_error", http_status=fetch_error.http_status,
+                    error_detail=str(fetch_error))
             conn.commit()
-            print(f"FETCH FAILED: {e}", file=sys.stderr)
+            print(f"FETCH FAILED: {fetch_error}", file=sys.stderr)
             return 1
 
         # ---------------------------------------------------------------
@@ -192,5 +217,42 @@ def main() -> int:
         conn.close()
 
 
+def run() -> int:
+    """main(), plus a last-resort record of anything main() failed to catch.
+
+    A run that dies without writing a fetch_log row is INVISIBLE: gate1_check.py
+    computes the run success rate from the rows that exist, so an uncaught crash
+    is counted as if it never happened and the gate reports a clean pipeline.
+    That is exactly what the 2026-08-10 04:15 UTC failure did — 10 rows in
+    fetch_log, all 'success' or 'stale', for a day that contained a failure.
+
+    The reordering in main() removes the known cause, but "we fixed the one we
+    found" is not a guarantee, so the outcome is recorded generically instead.
+    """
+    try:
+        return main()
+    except Exception as e:
+        # Redacted: fetch_log.error_detail is dumped by gate scripts whose
+        # output is screenshot as evidence, and an arbitrary exception may
+        # carry the connection string (see db.redact).
+        detail = redact(f"{type(e).__name__}: {e}")
+        print(f"CRASH: {detail}", file=sys.stderr)
+        try:
+            # A FRESH connection on purpose — whatever killed the run may well
+            # have been the old one.
+            conn = connect()
+            try:
+                log_row(conn, "crash", error_detail=detail[:2000])
+                conn.commit()
+                print("  recorded as fetch_log outcome='crash'", file=sys.stderr)
+            finally:
+                conn.close()
+        except Exception as log_error:
+            # Nothing left to do but say so. Never re-raise over the original.
+            print(f"  could not record the crash either: "
+                  f"{redact(str(log_error))}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())
