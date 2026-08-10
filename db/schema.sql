@@ -104,8 +104,14 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     -- NULL = this row describes the run as a whole.
     station_id     INTEGER     REFERENCES stations(station_id),
 
-    -- Run-level : 'success' | 'stale' | 'http_error' | 'parse_error'
+    -- Run-level : 'success' | 'stale' | 'http_error' | 'parse_error' | 'crash'
     -- Station-level: 'station_missing' | 'unknown_station'
+    --
+    -- 'crash' is written by scripts/ingest.py's run() wrapper for anything the
+    -- normal paths failed to catch. Deliberately not a CHECK constraint or an
+    -- ENUM: a run that cannot record why it died is invisible to Gate 1, so
+    -- rejecting an unanticipated outcome value would recreate the exact hole
+    -- this column exists to close.
     outcome        TEXT        NOT NULL,
 
     http_status    INTEGER,

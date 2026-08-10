@@ -29,11 +29,15 @@ CONNECT_ATTEMPTS = 3
 CONNECT_TIMEOUT_S = 15
 
 
-def _redact(text: str) -> str:
+def redact(text: str) -> str:
     """Strip anything password-shaped out of a message before it is printed.
 
     Defence in depth: the caller already avoids echoing the URL, but psycopg
     composes its own error text and we do not control what it puts there.
+
+    Public because scripts/ingest.py's crash handler stores exception text in
+    fetch_log.error_detail, and an arbitrary exception may carry the connection
+    string. One implementation, not two copies of the same regexes.
     """
     text = re.sub(r"://[^:/@\s]+:[^@\s]+@", "://***:***@", text)
     text = re.sub(r"password=\S+", "password=***", text, flags=re.IGNORECASE)
@@ -73,7 +77,7 @@ def connect(url: str | None = None) -> psycopg.Connection:
             # Bare Exception on purpose: psycopg raises several unrelated types
             # here (OperationalError, socket errors, DNS errors) and any of
             # them may carry the connection string in its text.
-            last = _redact(f"{type(e).__name__}: {e}")
+            last = redact(f"{type(e).__name__}: {e}")
             print(f"  db connect failed ({last}), attempt {attempt}/{CONNECT_ATTEMPTS} "
                   f"— Neon may be waking from suspend", file=sys.stderr)
             if attempt < CONNECT_ATTEMPTS:
