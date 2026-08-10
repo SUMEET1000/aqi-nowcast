@@ -15,10 +15,28 @@ on:
   # the bulletin. The extra run costs nothing — observations is keyed on the
   # bulletin timestamp, so a repeat is an upsert that changes nothing.
   #
-  # WHY :05 AND :35 rather than :00 — the top of the hour is GitHub's most
-  # congested slot and the most likely to be delayed.
+  # WHY :13 AND :43 rather than :05/:35, WHICH THIS USED TO BE. Measured over
+  # the first 11h of deployment: GitHub delivered 8 of ~22 due ticks (36%),
+  # 4-23 min late, with holes up to 3h32m. That is one run per hour, not two,
+  # so the margin the 30-minute cadence exists to provide was already gone.
+  # :05 and :35 are round-number slots and among the most contended; :13/:43
+  # are not.
+  #
+  # THIS IS AN EXPERIMENT, NOT A FIX. Read the delivery ratio that
+  # scripts/gate1_check.py now prints after ~24h:
+  #   - two runs landing per hour  -> it was slot congestion, done.
+  #   - still capped at ~1/hour    -> GitHub is throttling this workflow, and
+  #     the cron is not the lever. Adding ticks would buy nothing; the answer
+  #     is a redundant external trigger. Not built — see IDEAS.md.
+  # Never once did two ticks land in the same hour, which is what points at
+  # throttling rather than at independent random drops.
+  #
+  # Adding ticks was considered and rejected on evidence, not on cost: Neon
+  # bills ~5 min of compute per wake, so 2/hour is ~30 of the 100 CU-hours and
+  # even 4/hour would fit. The cliff is near 5-minute spacing, where the
+  # database stops suspending at all.
   schedule:
-    - cron: '5,35 * * * *'
+    - cron: '13,43 * * * *'
 
   # So the job can be fired by hand from the Actions tab without waiting for a
   # tick. Used to prove the pipeline works before the 72-hour Gate 1 clock.
