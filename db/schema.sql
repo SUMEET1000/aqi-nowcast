@@ -4,20 +4,14 @@
 -- it twice is a no-op and never destroys data. There is no DROP in this file
 -- and there must never be one: observations accumulate hourly and cannot be
 -- refetched (build plan §4).
---
--- Design notes live in the comments below rather than in a separate doc,
--- because the reasons are what stop a later phase from "fixing" something
--- that is deliberate.
 
 
--- ---------------------------------------------------------------------------
 -- stations — the lookup table.
 --
 -- Deviation from build plan §4, which puts latitude/longitude on every
 -- observation row. Coordinates are a property of a station, not of an hourly
--- reading. Repeating them plus a ~45-character station name across ~1.8M rows
--- a year would spend roughly a third of the free tier storing constants.
--- ---------------------------------------------------------------------------
+-- reading, and repeating them plus a ~45-character station name across ~1.8M
+-- rows a year spends roughly a third of the free tier storing constants.
 CREATE TABLE IF NOT EXISTS stations (
     station_id          SERIAL PRIMARY KEY,
 
@@ -25,7 +19,7 @@ CREATE TABLE IF NOT EXISTS stations (
     -- dirty: 'Municipal Corporation Office, Dharuhera -  HSPCB' has a double
     -- space, 'Sector-6, Panchkula - HSPCB ' has a trailing space.
     --
-    -- DO NOT TRIM, NORMALISE, OR CLEAN THIS COLUMN. Phase 0 (Gate 0.2) proved
+    -- Do not trim, normalise or clean this column. Phase 0 (Gate 0.2) proved
     -- OpenAQ carries the identical damage, so the exact-string join between the
     -- two sources currently succeeds. Cleaning one side alone silently drops
     -- those stations from the join — no error, just fewer rows.
@@ -45,9 +39,7 @@ CREATE TABLE IF NOT EXISTS stations (
 );
 
 
--- ---------------------------------------------------------------------------
 -- observations — the table that accumulates and can never be rebuilt.
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS observations (
     station_id       INTEGER     NOT NULL REFERENCES stations(station_id),
 
@@ -57,7 +49,7 @@ CREATE TABLE IF NOT EXISTS observations (
     pollutant_id     TEXT        NOT NULL,
 
     -- The API's bulletin timestamp, parsed from IST and stored as UTC. Used
-    -- as-is, NOT truncated to an hour bucket — it is the only time the API
+    -- as-is, not truncated to an hour bucket — it is the only time the API
     -- gives us, and bucketing would invent precision we do not have.
     --
     -- This column is what makes the ingester idempotent: a second run against
@@ -73,12 +65,12 @@ CREATE TABLE IF NOT EXISTS observations (
 
     -- Equal to observation_ts today, kept separately anyway. Phase 0
     -- correction 2 proved this is one national bulletin timestamp identical on
-    -- every row, so it can NEVER identify a single dead station — that has to
-    -- come from value-change detection. It does still detect a whole-feed
-    -- stall, which is a real and different failure mode.
+    -- every row, so it can never identify a single dead station — that has to
+    -- come from value-change detection. It does still catch a whole-feed stall,
+    -- which is a real and different failure mode.
     last_update_api  TIMESTAMPTZ NOT NULL,
 
-    -- FIRST time we saw this row, never updated afterwards (see the upsert in
+    -- First time we saw this row, never updated afterwards (see the upsert in
     -- scripts/ingest.py). Keeping it immutable is what makes bulletin-to-ingest
     -- latency measurable, and what makes a repeat run a true no-op.
     ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -87,16 +79,13 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 
 
--- ---------------------------------------------------------------------------
 -- fetch_log — one row per run, plus one row per anomaly.
 --
 -- Deviation from build plan §4, whose shape implies a row per station per run.
--- The ingester makes ONE HTTP call covering all of Haryana, so 30 identical
+-- The ingester makes one HTTP call covering all of Haryana, so 30 identical
 -- rows an hour would be ~21,600 redundant rows a month describing a single
--- event. Instead: one station_id IS NULL row carries the run outcome, and a
--- row with station_id set is written only when that specific station is
--- anomalous.
--- ---------------------------------------------------------------------------
+-- event. Instead one station_id IS NULL row carries the run outcome, and a row
+-- with station_id set is written only when that station is anomalous.
 CREATE TABLE IF NOT EXISTS fetch_log (
     id             BIGSERIAL   PRIMARY KEY,
     run_ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -104,14 +93,14 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     -- NULL = this row describes the run as a whole.
     station_id     INTEGER     REFERENCES stations(station_id),
 
-    -- Run-level : 'success' | 'stale' | 'http_error' | 'parse_error' | 'crash'
+    -- Run-level:    'success' | 'stale' | 'http_error' | 'parse_error' | 'crash'
     -- Station-level: 'station_missing' | 'unknown_station'
     --
     -- 'crash' is written by scripts/ingest.py's run() wrapper for anything the
     -- normal paths failed to catch. Deliberately not a CHECK constraint or an
     -- ENUM: a run that cannot record why it died is invisible to Gate 1, so
-    -- rejecting an unanticipated outcome value would recreate the exact hole
-    -- this column exists to close.
+    -- rejecting an unanticipated outcome would reopen the exact hole this
+    -- column exists to close.
     outcome        TEXT        NOT NULL,
 
     http_status    INTEGER,
@@ -125,10 +114,29 @@ CREATE TABLE IF NOT EXISTS fetch_log (
 );
 
 
--- ---------------------------------------------------------------------------
 -- Indexes. Only the two access patterns that actually exist: "what is the
 -- newest reading" (Phase 2 bot) and "how did the last N runs go" (Gate 1).
 -- Every index costs write time on an hourly job, so nothing speculative.
--- ---------------------------------------------------------------------------
+--
+-- observations_ts_idx is not what answers the newest-reading query: the PRIMARY
+-- KEY (station_id, pollutant_id, observation_ts) already serves it by a backward
+-- index scan. Nor does it help the gate queries, which wrap observation_ts in
+-- date_trunc('hour', ...) and are therefore not sargable. Kept because it is
+-- cheap at this volume and does serve a plain ORDER BY observation_ts DESC. If
+-- check_gaps gets slow at ~1.8M rows, the fix is an expression index on
+-- date_trunc('hour', observation_ts), not this one.
 CREATE INDEX IF NOT EXISTS observations_ts_idx ON observations (observation_ts DESC);
 CREATE INDEX IF NOT EXISTS fetch_log_run_ts_idx ON fetch_log (run_ts DESC);
+
+-- One OpenAQ location must not back two CPCB stations.
+--
+-- Without this, two stations sharing an id is accepted silently and Phase 3
+-- pulls the SAME history for both, then treats them as independent series —
+-- a silent modelling error, which is the failure class Gate 0.2 exists for.
+-- scripts/seed_stations.py checks the mapping doc for the same thing; this is
+-- the constraint that makes it true of the table rather than of one input file.
+--
+-- Postgres allows multiple NULLs in a unique index, so a station without an
+-- OpenAQ id is still permitted.
+CREATE UNIQUE INDEX IF NOT EXISTS stations_openaq_location_id_key
+    ON stations (openaq_location_id);
