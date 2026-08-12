@@ -2,7 +2,8 @@
 
 Maps every live CPCB station to a history source and proves none was dropped.
 
-The gate is the accounting assertion: mapped + unmatched == total. A merge that
+The gate is gate_verdict(): every station accounted for AND at least
+MIN_MAPPED_FRACTION of them actually mapped. A merge that
 silently drops rows is the failure mode §0.2 warns about (same class as the
 district-name bug on the farm project) — it raises nothing and looks fine.
 
@@ -17,6 +18,7 @@ Stdlib only.
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
 import urllib.error
@@ -30,8 +32,8 @@ from cpcb_api import (
     FetchError,
     fetch as fetch_cpcb,
     load_key as load_cpcb_key,
-    require_env,
 )
+from env import require_env
 
 OPENAQ = "https://api.openaq.org/v3"
 # Haryana bounding box: minLon, minLat, maxLon, maxLat
@@ -135,12 +137,50 @@ def build_mapping(cpcb_stations: list[str], oa: dict[str, dict]) -> tuple[list, 
         else:
             unmatched.append(name)
 
-    # THE GATE. A dropped station must fail loudly, not shrink the output.
-    total = len(mapped) + len(unmatched)
-    if total != len(cpcb_stations):
-        sys.exit(f"ACCOUNTING FAILURE: {len(mapped)} mapped + {len(unmatched)} unmatched "
-                 f"= {total}, but {len(cpcb_stations)} stations went in. Rows were dropped.")
     return mapped, unmatched
+
+
+# The share of CPCB stations that must map to OpenAQ for Gate 0.2 to pass.
+#
+# 30 of 30 map today. This floor exists to catch the failure the gate is
+# actually for: OpenAQ renaming its Haryana locations (adding a state suffix,
+# dropping the ' - HSPCB') so the exact-string join collapses. That is silent —
+# no error, just fewer rows — and it would leave Phase 3/4 training on a
+# fraction of the stations while every script still exits 0.
+#
+# Not 100%: one station drifting should not block the project, and build plan
+# §0.2 explicitly tolerates unmatched stations as long as they are listed (they
+# are, further down this file). 80% catches a collapse without being brittle.
+MIN_MAPPED_FRACTION = 0.8
+
+
+def gate_verdict(mapped: list, unmatched: list, total: int) -> tuple[bool, list[str]]:
+    """Gate 0.2, as one expression driving both the exit code and the doc.
+
+    It replaces an assertion that could never fire — comparing
+    len(mapped) + len(unmatched) against the input count, when every name is
+    appended to exactly one of those two lists, so the condition is unreachable
+    by construction (confirmed by 2000 randomised trials, none of which made it
+    fire). The real gate was that tautology and len(mapped) > 0, which passes
+    with one station mapped out of thirty, while render_doc printed
+    'Accounting assertion: **PASS**' as an unconditional string literal — so the
+    committed evidence file said PASS regardless of what happened.
+
+    Deriving both from here is what stops the doc disagreeing with the exit code.
+    """
+    reasons = []
+    if total == 0:
+        reasons.append("no CPCB stations came back from the live API")
+    accounted = len(mapped) + len(unmatched)
+    if accounted != total:
+        reasons.append(f"{len(mapped)} mapped + {len(unmatched)} unmatched = "
+                       f"{accounted}, but {total} stations went in — rows were dropped")
+    if total and len(mapped) / total < MIN_MAPPED_FRACTION:
+        reasons.append(f"only {len(mapped)}/{total} stations mapped to OpenAQ "
+                       f"({len(mapped) / total:.0%}, need "
+                       f"{MIN_MAPPED_FRACTION:.0%}) — the exact-string join has "
+                       f"collapsed; check whether OpenAQ renamed its locations")
+    return not reasons, reasons
 
 
 def _dt(s: str) -> datetime:
@@ -163,6 +203,14 @@ def pm25_blocks(sensor_ids: list[int], key: str) -> list[dict]:
         detail = openaq_get(f"sensors/{sid}", key)["results"][0]
         first, last = detail.get("datetimeFirst"), detail.get("datetimeLast")
         if not first or not last:
+            # Named, not swallowed (§0.5) — a bare `continue` here, in the file
+            # whose whole purpose is catching silent row drops, let a sensor with
+            # missing span metadata vanish from `blocks`. recent_block() then
+            # returned a different sensor's block, and the committed
+            # station_mapping.md published that block plus a median computed over
+            # a quietly reduced sample.
+            print(f"    WARNING  sensor {sid} has no datetimeFirst/Last — excluded "
+                  f"from this station's history blocks", file=sys.stderr)
             continue
         blocks.append({
             "sensor_id": sid,
@@ -181,9 +229,16 @@ def recent_block(blocks: list[dict]) -> dict | None:
     return blocks[-1] if blocks else None
 
 
-def render_doc(mapped: list, unmatched: list) -> str:
+def render_doc(mapped: list, unmatched: list, total: int) -> str:
+    # `total` is passed in rather than recomputed as len(mapped)+len(unmatched),
+    # which would be the same tautology gate_verdict exists to remove: the doc
+    # must be able to report that stations went missing.
+    ok, reasons = gate_verdict(mapped, unmatched, total)
     recents = [m["recent"]["days"] for m in mapped if m.get("recent")]
-    median_recent = sorted(recents)[len(recents) // 2] if recents else 0
+    # statistics.median, not sorted(x)[len(x)//2] — the latter is the UPPER
+    # median for an even count, and this number is published in a committed doc
+    # labelled "Median".
+    median_recent = round(statistics.median(recents)) if recents else 0
     gapped = [m for m in mapped
               if any((b.get("gap_before_days") or 0) > 30 for b in m.get("blocks", []))]
 
@@ -195,12 +250,16 @@ def render_doc(mapped: list, unmatched: list) -> str:
         "",
         "## Gate result",
         "",
-        f"- CPCB live stations: **{len(mapped) + len(unmatched)}**",
+        f"- CPCB live stations: **{total}**",
         f"- Mapped to OpenAQ: **{len(mapped)}** "
         f"({sum(1 for m in mapped if m['how'] == 'exact')} exact, "
         f"{sum(1 for m in mapped if m['how'] == 'manual')} manual)",
         f"- Unmatched: **{len(unmatched)}**",
-        f"- Accounting assertion `mapped + unmatched == total`: **PASS**",
+        # From the same expression that decides the exit code, never hardcoded.
+        # As the literal string '**PASS**' this line made the committed doc
+        # assert the gate had passed no matter what the run did.
+        f"- Gate verdict: **{'PASS' if ok else 'FAIL'}**"
+        + ("" if ok else " — " + "; ".join(reasons)),
         "",
         "## Why this gate exists",
         "",
@@ -314,7 +373,7 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        records = fetch_cpcb(args.state, load_cpcb_key())
+        records, _ = fetch_cpcb(args.state, load_cpcb_key())
     except FetchError as e:
         sys.exit(str(e))
     cpcb_rows = {r["station"]: r for r in records}
@@ -344,19 +403,21 @@ def main() -> int:
               if any((b.get("gap_before_days") or 0) > 30 for b in m["blocks"])]
     if recents:
         print(f"contiguous recent PM2.5 history: min={min(recents)}d "
-              f"median={sorted(recents)[len(recents) // 2]}d max={max(recents)}d")
+              f"median={statistics.median(recents):.0f}d max={max(recents)}d")
         print(f"stations with a >30d gap in their record: {len(gapped)}/{len(mapped)}")
 
     if args.write_doc:
         out = os.path.join(os.path.dirname(__file__), "..", "docs", "station_mapping.md")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as fh:
-            fh.write(render_doc(mapped, unmatched))
+            fh.write(render_doc(mapped, unmatched, len(cpcb_rows)))
         print(f"wrote {os.path.normpath(out)}")
 
-    ok = len(mapped) + len(unmatched) == len(cpcb_rows) and len(mapped) > 0
-    print(f"GATE 0.2: {'PASS' if ok else 'FAIL'} "
-          f"(every station accounted for: {len(mapped)}+{len(unmatched)}={len(cpcb_rows)})")
+    ok, reasons = gate_verdict(mapped, unmatched, len(cpcb_rows))
+    print(f"GATE 0.2: {'PASS' if ok else 'FAIL'} — {len(mapped)}/{len(cpcb_rows)} "
+          f"mapped, {len(unmatched)} unmatched")
+    for r in reasons:
+        print(f"  - {r}")
     return 0 if ok else 1
 
 
