@@ -1,6 +1,6 @@
 // Fires scripts/ingest.py by asking GitHub to run the `ingest` workflow.
 //
-// This file holds NO secret. The GitHub token lives only as an encrypted Worker
+// This file holds no secret. The GitHub token lives only as an encrypted Worker
 // secret (`wrangler secret put GH_PAT`) and is never in the repo, never printed,
 // and never returned in a response. See trigger/README.md.
 
@@ -8,20 +8,31 @@ const OWNER = "SUMEET1000";
 const REPO = "aqi-nowcast";
 const WORKFLOW = "ingest.yml";
 
-// Deliberately the workflow-dispatch endpoint, NOT repository-dispatch.
-//
-// repository_dispatch requires a token with `Contents: write`. A token that can
-// write repository contents can push a workflow file, and a pushed workflow runs
-// with this repo's Actions secrets — so a leak at the trigger host would expose
-// DATABASE_URL and DATA_GOV_IN_API_KEY. GitHub masks registered secrets in logs,
-// but masking does not survive an attacker who base64-encodes the value first.
+// The workflow-dispatch endpoint, deliberately, rather than
+// repository-dispatch. repository_dispatch needs a token with
+// `Contents: write`, and a token that can write repository contents can push a
+// workflow file — which then runs with this repo's Actions secrets, so a leak
+// at the trigger host would expose DATABASE_URL and DATA_GOV_IN_API_KEY. GitHub
+// masks registered secrets in logs, but masking does not survive an attacker
+// who base64-encodes the value first.
 //
 // workflow_dispatch needs only `Actions: write`, which can start a run and
 // nothing else. Same result, far smaller blast radius if the token ever leaks.
 const ENDPOINT =
   `https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/dispatches`;
 
-async function dispatch(env) {
+// Three attempts, ~1s then ~2s apart. This Worker is the only trigger that
+// fires on time — GitHub's own cron is throttled to ~31% delivery and 15-22 min
+// late (trigger/README.md) — so a single transient failure here is not "retry
+// next tick", it is a bulletin that may never be captured: CPCB keeps each one
+// on the feed for about an hour and publishes no archive. Three and not more
+// because a cron invocation should not sit for a minute and the next tick is
+// only 30 minutes away.
+const ATTEMPTS = 3;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function attemptDispatch(env) {
   const res = await fetch(ENDPOINT, {
     method: "POST",
     headers: {
@@ -39,30 +50,58 @@ async function dispatch(env) {
 
   // No silent fallbacks (build plan §0.5). GitHub's REST docs are inconsistent
   // about whether this endpoint answers 204 or 200, so accept any 2xx rather
-  // than hardcoding one and failing on the other. Everything else throws, which
-  // surfaces in the Workers error metrics and in `wrangler tail`.
-  //
-  // A 403 here almost certainly means the PAT is missing the `Actions: write`
-  // repository permission; a 404 usually means the token is not scoped to this
-  // repository at all (GitHub returns 404 rather than 403 to avoid confirming
-  // that a private resource exists). A 401 means it expired — fine-grained PATs
-  // do expire, and when that happens ingestion quietly falls back to GitHub's
-  // throttled cron rather than stopping outright, which is why gate1_check.py
-  // measures hours-covered instead of trusting that this ran.
-  if (!res.ok) {
-    throw new Error(
-      `dispatch failed: HTTP ${res.status} ${await res.text()}`,
-    );
+  // than hardcoding one and failing on the other.
+  if (res.ok) return;
+
+  // A 401/403/404 is a fact about the credential, not a transient one, so
+  // retrying just burns the invocation three times over:
+  //   401 — the PAT expired. Fine-grained PATs always do.
+  //   403 — the PAT is missing the `Actions: write` repository permission.
+  //   404 — the PAT is not scoped to this repository at all. GitHub answers 404
+  //         rather than 403 so it does not confirm a private resource exists.
+  // Marked non-retryable so the error surfaces on the first attempt with the
+  // real status still attached, instead of as three identical failures.
+  const permanent = res.status === 401 || res.status === 403 || res.status === 404;
+  const err = new Error(`dispatch failed: HTTP ${res.status} ${await res.text()}`);
+  err.permanent = permanent;
+  throw err;
+}
+
+async function dispatch(env) {
+  let last;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      return await attemptDispatch(env);
+    } catch (e) {
+      last = e;
+      // A network-level rejection has no .permanent, so it retries — that is
+      // the case this loop mainly exists for.
+      if (e.permanent || attempt === ATTEMPTS) break;
+      console.log(`dispatch attempt ${attempt}/${ATTEMPTS} failed: ${e.message}`);
+      await sleep(1000 * attempt);
+    }
   }
+
+  // Still throws (§0.5) — a failed dispatch must fail the invocation.
+  //
+  // Known gap, left open on purpose: this surfaces only in Cloudflare's error
+  // metrics and `wrangler tail`, and Cloudflare does not email on Worker
+  // exceptions, so a dead PAT degrades to GitHub's throttled cron quietly.
+  // Wiring an alert channel now needs either a Telegram token (Phase 2
+  // scaffolding, which build plan §0.2 forbids ahead of its phase) or a PAT
+  // widened beyond `Actions: write` to open issues, which would undo the
+  // blast-radius decision above. It belongs to Phase 5 monitoring; until then
+  // the backstop is gate1_check.py's hours-covered number.
+  throw last;
 }
 
 export default {
   // Cron trigger. Cloudflare invokes this on the schedule in wrangler.toml.
   //
-  // AWAITED, not handed to ctx.waitUntil(). waitUntil would let this handler
-  // return successfully while the dispatch rejected in the background — the
+  // Awaited, not handed to ctx.waitUntil(). waitUntil would let this handler
+  // return successfully while the dispatch rejected in the background, so the
   // invocation would be recorded as a success and the failure would show up
-  // only as an unhandled rejection. Awaiting means a failed dispatch fails the
+  // only as an unhandled rejection. Awaiting makes a failed dispatch fail the
   // invocation, which is the whole point of throwing above (§0.5).
   async scheduled(event, env, ctx) {
     await dispatch(env);
