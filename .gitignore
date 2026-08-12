@@ -1,12 +1,19 @@
-# Secrets — never commit
-.env
-.env.local
+# Secrets — never commit.
+#
+# A glob, not an enumeration. Listing `.env` and `.env.local` left
+# `.env.production` and `.env.prod` trackable, confirmed with `git check-ignore`:
+# an enumeration only covers the suffixes someone thought of. The negation is
+# what keeps the one file that must stay committed.
+.env*
+!.env.example
 
 # Cloudflare Wrangler (trigger/). `.dev.vars` is where wrangler puts secrets for
-# local runs — it would hold the GitHub PAT in plaintext. `.wrangler/` is local
-# state. Listed here BEFORE trigger/ was created, not after: this repo has
-# already published files it should not have once.
-.dev.vars
+# local runs, so it would hold the GitHub PAT in plaintext; `.wrangler/` is local
+# state. Listed before trigger/ was created rather than after — this repo has
+# already published files it should not have, once. Globbed for the same reason
+# as .env above: wrangler supports `.dev.vars.<environment>`, so
+# `.dev.vars.production` was not covered.
+.dev.vars*
 .wrangler/
 node_modules/
 
@@ -30,24 +37,29 @@ venv/
 # content — regenerate with /graphify rather than committing it.
 graphify-out/
 
-# ---------------------------------------------------------------------------
-# AI-agent working files. NEVER PUBLISH THESE.
+# graphify's own exclude list. Scaffolding, and it names the private files by
+# path, so it stays local for the same reason .claude/ does.
+.graphifyignore
+
+# AI-agent working files. Never publish these. The repo is a public portfolio
+# piece and what belongs in it is the system — pipeline, schema, gates — not the
+# scaffolding used to build it or private notes about the person building it.
 #
-# This repo is a public portfolio piece. What belongs in it is the system —
-# the pipeline, the schema, the gates. What does not belong in it is the
-# scaffolding used to build it, or private notes about the person building it.
+#   .claude/     agent instructions, and the build plan, which carries personal
+#                career context (placement timing, other projects, risk notes)
+#   CLAUDE.md    agent operating instructions for this repo
+#   IDEAS.md     the scope-creep parking lot — unbuilt ideas, not deliverables
+#   PROGRESS.md  the build journal, written as interview preparation. It names
+#                every mistake made here in the first person, for recall rather
+#                than for publication; the README is the public account of the
+#                same work.
 #
-#   .claude/    agent instructions, and the build plan, which carries personal
-#               career context (placement timing, other projects, risk notes)
-#   CLAUDE.md   agent operating instructions for this repo
-#   IDEAS.md    the scope-creep parking lot — unbuilt ideas, not deliverables
-#
-# These stay on disk and are still the authority for how the project is built.
-# They are simply not part of what is published.
-# ---------------------------------------------------------------------------
+# They stay on disk and remain the authority for how the project is built. They
+# are just not part of what is published.
 .claude/
 CLAUDE.md
 IDEAS.md
+PROGRESS.md
 
 # OS / editor
 .DS_Store
