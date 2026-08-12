@@ -1,40 +1,29 @@
-# The Phase 1 ingester. The most important file in the repo: every bulletin it
-# misses is training data that can never be recovered (build plan §4).
-#
-# Build plan §4 forbids running this inside a web dyno — a free web service
-# sleeps after 15 minutes idle and its cron dies silently. GitHub Actions runs
-# on GitHub's machines and has no such thing to sleep.
+# The Phase 1 ingester. Every bulletin it misses is training data that can never
+# be recovered (build plan §4), which is why §4 also forbids running this inside
+# a web dyno — a free web service sleeps after 15 minutes idle and its cron dies
+# silently. GitHub's machines have no such thing to sleep.
 name: ingest
 
 on:
-  # Every 30 minutes, offset off the hour.
+  # Twice an hour against CPCB's hourly publishing, because GitHub's scheduled
+  # runs are best-effort: under load they are delayed 15+ minutes and sometimes
+  # skipped outright, so a second attempt still catches the bulletin. The extra
+  # run costs nothing — observations is keyed on the bulletin timestamp, so a
+  # repeat is an upsert that changes nothing.
   #
-  # WHY 30 MINUTES when CPCB publishes hourly: GitHub's scheduled runs are
-  # best-effort. Under load they are delayed 15+ minutes and are occasionally
-  # skipped outright. Running twice per hour means a delayed run still catches
-  # the bulletin. The extra run costs nothing — observations is keyed on the
-  # bulletin timestamp, so a repeat is an upsert that changes nothing.
+  # This is the backup trigger, not the primary one. Measured over 18h, GitHub
+  # delivered 11 of ~36 requested ticks (31%), every one 15-22 min late, with
+  # holes of 102-167 min; moving the offsets :05,:35 -> :13,:43 changed nothing
+  # and made the delay worse, ruling out slot congestion. What settled it was
+  # the trigger-type split — workflow_dispatch landed in 0 seconds, all four
+  # times, against 15-22 minutes for every scheduled run. The throttle is on the
+  # scheduled-event queue rather than on this repo's ability to run jobs, so an
+  # API trigger bypasses it. The Cloudflare Worker in trigger/ is that API
+  # trigger and fires at :05 and :35; trigger/README.md carries the full
+  # measurements and the known failure modes.
   #
-  # WHY :13 AND :43 rather than :05/:35, WHICH THIS USED TO BE. Measured over
-  # the first 11h of deployment: GitHub delivered 8 of ~22 due ticks (36%),
-  # 4-23 min late, with holes up to 3h32m. That is one run per hour, not two,
-  # so the margin the 30-minute cadence exists to provide was already gone.
-  # :05 and :35 are round-number slots and among the most contended; :13/:43
-  # are not.
-  #
-  # THIS IS AN EXPERIMENT, NOT A FIX. Read the delivery ratio that
-  # scripts/gate1_check.py now prints after ~24h:
-  #   - two runs landing per hour  -> it was slot congestion, done.
-  #   - still capped at ~1/hour    -> GitHub is throttling this workflow, and
-  #     the cron is not the lever. Adding ticks would buy nothing; the answer
-  #     is a redundant external trigger. Not built — see IDEAS.md.
-  # Never once did two ticks land in the same hour, which is what points at
-  # throttling rather than at independent random drops.
-  #
-  # Adding ticks was considered and rejected on evidence, not on cost: Neon
-  # bills ~5 min of compute per wake, so 2/hour is ~30 of the 100 CU-hours and
-  # even 4/hour would fit. The cliff is near 5-minute spacing, where the
-  # database stops suspending at all.
+  # Keep this cron. It is free, it is a continuing control measurement, and it
+  # is what still runs if the Worker's PAT expires.
   schedule:
     - cron: '13,43 * * * *'
 
@@ -47,34 +36,76 @@ concurrency:
   group: ingest
   cancel-in-progress: false
 
+# This job reads a public repo and runs Python. It needs nothing from
+# GITHUB_TOKEN — no push, no comment, no release. With no block declared the
+# token inherits the repository default, which is read/write on many accounts,
+# so anything executing here could push a commit or edit .github/workflows/ —
+# and a pushed workflow runs with this repo's Actions secrets. Same blast-radius
+# argument that made trigger/src/index.js pick `Actions: write` over
+# `Contents: write`.
+#
+# `contents: read` and not `{}`: an empty map leaves GITHUB_TOKEN with no scopes
+# at all, and actions/checkout authenticates its clone with that token. Breaking
+# checkout stops ingestion, and every bulletin missed while someone works out
+# why is unrecoverable — not worth trading for one scope that only permits
+# reading a repository which is already public.
+permissions:
+  contents: read
+
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15, not 10. Worst case inside ingest.py alone is ~6.4 min — fetch is 5
+    # attempts x 60s timeout plus 2+4+8+16s backoff, then connect() is 3 x 15s
+    # plus 2+4s — and that is before checkout, setup-python and pip. A slow pip
+    # plus a slow Neon wake can cross 10 minutes, and a run killed by the
+    # timeout is SIGKILLed, so it writes no fetch_log row and is invisible to
+    # Gate 1: the exact hole ingest.run() exists to close.
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      # Pinned to commit SHAs, not to v5/v6, because a major tag is a branch
+      # GitHub can move. A tag mutation or a maintainer compromise gives an
+      # attacker code execution before the Ingest step, in the same job, with
+      # DATABASE_URL and DATA_GOV_IN_API_KEY about to enter its environment —
+      # enough to rewrite scripts/ingest.py in the workspace. First-party
+      # actions, so the likelihood is low, but a SHA costs nothing.
+      #
+      # These were v4/v5, which run on the deprecated Node 20; bumped in the
+      # same change as the pinning so the workflow is touched once, not twice.
+      # To update: read the tag's SHA (gh api repos/actions/checkout/git/ref/tags/v5)
+      # and change the SHA and the trailing comment together.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          # Pinned to match local. This machine has Python 3.13 as `python` and
-          # 3.14 as `python3`; leaving the version unpinned here is how a cron
-          # ends up on a different interpreter than anything ever tested.
-          python-version: '3.13'
+          # Default is true, which writes GITHUB_TOKEN into .git/config inside
+          # the workspace — the same workspace the Ingest step then runs with
+          # DATABASE_URL and DATA_GOV_IN_API_KEY in its environment. Nothing
+          # here pushes, so there is no reason to leave a credential on disk.
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          # Read from .python-version rather than repeated here. The dev machine
+          # has Python 3.13 as `python` and 3.14 as `python3`, so "which
+          # interpreter was this tested on" is a real question — one file answers
+          # it for the runner, for pyenv, and for anyone reading the repo. Two
+          # copies of the number is how CI ends up on an interpreter nothing was
+          # ever tested against, which is the failure this pin exists to stop.
+          python-version-file: .python-version
           cache: pip
 
       - name: Install frozen dependencies
         run: pip install -r requirements.txt
 
-      # Fail fast, and say WHICH credential is wrong. Without this the job just
-      # exits 1 from inside ingest.py with no fetch_log row written, and the two
-      # possible causes (missing API key vs unreachable database) are
-      # indistinguishable from the outside. A pipeline whose whole value is
-      # uninterrupted uptime has to name its own failure.
+      # Fail fast, and say which credential is wrong. Without this the job exits
+      # 1 from inside ingest.py with no fetch_log row written, and the two
+      # possible causes — missing API key, unreachable database — look identical
+      # from outside. A pipeline whose whole value is uninterrupted uptime has to
+      # name its own failures.
       #
-      # Values are never printed — only presence, length, and shape. GitHub
-      # masks registered secrets in logs anyway, but this log is public, so the
-      # code does not rely on that.
+      # Values are never printed, only presence, length and shape. GitHub masks
+      # registered secrets in logs anyway, but this log is public, so nothing
+      # here relies on that.
       - name: Preflight — check secrets are present and well-formed
         env:
           DATA_GOV_IN_API_KEY: ${{ secrets.DATA_GOV_IN_API_KEY }}
@@ -96,15 +127,29 @@ jobs:
               postgres://*|postgresql://*) echo "  scheme: ok" ;;
               *) echo "::error::DATABASE_URL does not start with postgres:// or postgresql:// — it was probably truncated or the wrong field was copied."; status=1 ;;
             esac
+            # sslmode=require encrypts but verifies nothing — no certificate, no
+            # hostname — and this step accepted it as "ok". The modes below
+            # permit a plaintext connection outright and are a hard failure;
+            # `require` stays a warning until DATABASE_URL has been migrated in
+            # both .env and this repo's secret (see scripts/db.py).
             case "$DATABASE_URL" in
-              *sslmode=require*) echo "  sslmode=require: ok" ;;
-              *) echo "::warning::DATABASE_URL has no sslmode=require — Neon may refuse the connection." ;;
+              *sslmode=verify-full*|*sslmode=verify-ca*) echo "  sslmode: verifying, ok" ;;
+              *sslmode=disable*|*sslmode=allow*|*sslmode=prefer*)
+                echo "::error::DATABASE_URL permits an unencrypted connection. Use ?sslmode=verify-full&sslrootcert=system"; status=1 ;;
+              *sslmode=require*)
+                echo "::warning::sslmode=require encrypts but does NOT verify the server certificate. Migrate to ?sslmode=verify-full&sslrootcert=system" ;;
+              *) echo "::warning::DATABASE_URL has no sslmode — expected ?sslmode=verify-full&sslrootcert=system" ;;
             esac
           fi
           exit $status
 
       - name: Ingest
         env:
+          # stdout is block-buffered under a pipe while stderr is not, so
+          # without this the summary line and the anomaly lines it belongs with
+          # can appear out of order — or stdout flushes only at exit. This log
+          # is the artifact a failure gets diagnosed from.
+          PYTHONUNBUFFERED: "1"
           # Entered by a human in Settings -> Secrets and variables -> Actions.
           # Never printed by the code: scripts/db.py redacts anything
           # password-shaped before it reaches this log, because Actions logs on
@@ -113,13 +158,10 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/ingest.py
 
-# Two GitHub behaviours designed around rather than discovered later:
-#
-#  1. GitHub DISABLES scheduled workflows on a repository with 60 days of no
-#     commits. A dormant repo silently stops collecting. Push something, or
-#     re-enable it from the Actions tab.
-#
-#  2. GitHub emails you when a run FAILS. It tells you nothing when a scheduled
-#     run is SKIPPED. That blind spot is what the missing-hour query in
-#     scripts/gate1_check.py exists to catch, and what Phase 5 monitoring is
-#     for.
+# Two GitHub behaviours worth designing around rather than discovering later.
+# GitHub disables scheduled workflows on a repository with 60 days of no
+# commits, so a dormant repo silently stops collecting — push something, or
+# re-enable from the Actions tab. And GitHub emails you when a run fails but
+# says nothing when a scheduled run is skipped, which is the blind spot the
+# missing-hour query in scripts/gate1_check.py exists to catch and what Phase 5
+# monitoring is for.
