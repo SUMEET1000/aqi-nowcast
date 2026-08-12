@@ -52,12 +52,39 @@ already averaged over CPCB's own period for that pollutant and then try to **dis
 - **B** — a recently published average must fall inside this row's `[min, max]`, because the
   two windows overlap almost completely.
 
-**Status 2026-08-10: WITHHELD on sample size — 12 bulletins over 18h, the probe needs 24 over
-24h.** All seven pollutants provisionally read as **already averaged**, both tests agreeing.
-Corroborated by hand on the Ambala seed station: PM2.5 drifted 48 → 40 over 18h, never moving
-more than 1 µg/m³ in an hour, with `min`/`max` spanning 8–56 — a day's range, not an hour's.
-**Do not write this into the README as settled.** Re-run the probe when the sample is there;
-it exits 0 only when it reaches a verdict.
+**Status 2026-08-11: NOT DISPROVED, on 26 bulletins over 40.0h (2026-08-09 17:30 → 2026-08-11
+09:30 UTC), via `python scripts/probe_avg_window.py` (exit 0).** All seven pollutants — CO,
+NH₃, NO₂, O₃, PM10, PM2.5, SO₂ — survived both tests: Test A found 0 impossible steps for the
+five 24-hourly pollutants and ≤1% for the two 8-hourly ones, Test B found ≤1% envelope escapes
+everywhere (PM2.5: 0 of 2293).
+
+**This is a failure to reject, not a confirmation.** Neither test can prove a long window; they
+can only break one, and neither broke. Three limits on what it is worth:
+
+1. **The two tests are not independent** — both read the same `[min, max]` envelope. "A and B
+   agree" is one measurement, not two.
+2. **Test A's power is low exactly where it matters most.** The probe reports the share of pairs
+   whose ceiling a 2-unit step could have exceeded: PM2.5 **20%**, PM10 15%, both barely over
+   the `POWER_FLOOR = 0.10` that would have marked them `UNTESTABLE`. So for our headline
+   pollutant, ~80% of pairs could not have registered a violation whatever the truth was.
+3. Corroborated by hand on the Ambala seed station: PM2.5 drifted 48 → 40 over 18h, never moving
+   more than 1 µg/m³ in an hour, with `min`/`max` spanning 8–56 — a day's range, not an hour's.
+
+**Phase 2 therefore proceeds on the ASSUMPTION that the overall AQI is computable from a single
+bulletin** — written here as an assumption with its date and sample size, which is the claim.
+**Do not write it into the README as settled.** If Phase 4's lag features behave strangely, this
+is the first thing to re-examine.
+
+Test C priced the alternative on the same run: over 510 station-hours with a full 24h lookback,
+CPCB's ≥16-of-24 rule would be met **89.2%** of the time, and the ≥3-pollutant overall-AQI rule
+also 89.2%. So building the window ourselves is viable if this assumption ever fails.
+
+**Probe bug found and fixed on this run:** the uncommitted 2026-08-11 edits (POWER column,
+strict-inequality fix) added explanatory SQL comments containing literal `%` — `~17%`, `2%`,
+`100%` — inside parameterised queries. psycopg scans the whole query string for placeholders, so
+it raised `incomplete placeholder: '%'` and Test B crashed before running; Test C would have
+crashed the same way. Doubled to `%%`. The 2026-08-10 run predates those comments, which is why
+it got through. **A comment is not inert inside a `cur.execute()` string.**
 
 Two things that probe got wrong at first, worth not repeating:
 
