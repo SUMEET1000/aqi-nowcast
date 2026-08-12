@@ -72,11 +72,18 @@ curl -s "https://api.github.com/repos/SUMEET1000/aqi-nowcast/actions/workflows/i
 
 ```bash
 cd trigger
-npm install -g wrangler     # or: npx wrangler <command>
-wrangler login
-wrangler secret put GH_PAT  # paste the token — it is encrypted, never in the repo
-wrangler deploy
+npm ci                          # installs the exact wrangler in package-lock.json
+npx wrangler login
+npx wrangler secret put GH_PAT  # paste the token — encrypted, never in the repo
+npx wrangler deploy
 ```
+
+`npm ci`, not `npm install -g wrangler`. A global wrangler is whatever version happened to be
+current the day it was installed, on the one machine that has it — so the tool that deploys
+the trigger is the only part of this system that was not pinned. `package.json` pins
+`wrangler` exactly and `package-lock.json` carries an integrity hash for all 91 packages in
+its closure; `npm ci` installs that and fails rather than silently resolving something else.
+`node_modules/` is gitignored, the lockfile is not.
 
 **Before the first deploy, open Workers & Pages once in the Cloudflare dashboard.** The
 account needs a `workers.dev` subdomain to exist, even though this Worker sets
