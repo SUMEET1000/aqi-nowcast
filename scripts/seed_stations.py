@@ -55,6 +55,24 @@ def parse_mapping_doc() -> dict[str, int]:
                     sys.exit(f"mapping doc gives two OpenAQ ids for {name!r}")
                 mapping[name] = openaq_id
 
+    # The reverse check. One name with two ids is rejected above; two names with
+    # one id was not, and that is the direction that corrupts training data
+    # silently instead of crashing — Phase 3 pulls the same OpenAQ history for
+    # two different CPCB stations and treats it as two independent series. It is
+    # the silent-merge class Gate 0.2 exists to catch, and the MANUAL_MAP in
+    # probe_history.py is the obvious way it gets in.
+    by_id: dict[int, list[str]] = {}
+    for name, openaq_id in mapping.items():
+        by_id.setdefault(openaq_id, []).append(name)
+    shared = {i: names for i, names in by_id.items() if len(names) > 1}
+    if shared:
+        for openaq_id, names in sorted(shared.items()):
+            print(f"  OpenAQ id {openaq_id} is claimed by {len(names)} stations: "
+                  f"{sorted(names)}", file=sys.stderr)
+        sys.exit(f"{len(shared)} OpenAQ id(s) mapped to more than one CPCB station. "
+                 "Two stations sharing one history is a silent modelling error, "
+                 "not a duplicate row. Fix MANUAL_MAP in scripts/probe_history.py.")
+
     if not mapping:
         sys.exit(
             f"parsed 0 rows from {os.path.normpath(MAPPING_DOC)}. "
@@ -65,7 +83,7 @@ def parse_mapping_doc() -> dict[str, int]:
 
 def main() -> int:
     try:
-        records = fetch("Haryana", load_key())
+        records, _ = fetch("Haryana", load_key())
     except FetchError as e:
         sys.exit(str(e))
 
@@ -127,8 +145,34 @@ def main() -> int:
             )
             total, with_openaq = cur.fetchone()
 
+            # is_active is deliberately NOT reset by the upsert above. Nothing
+            # in this repo ever sets it FALSE, so a FALSE is a human decision to
+            # retire a station, and silently flipping it back on a re-seed would
+            # overrule that without saying so (§0.5).
+            #
+            # But a station that is live AND inactive is a dead end for the
+            # ingester: it is absent from `known` (which filters on is_active)
+            # so it is not "missing", and it is not in the mapping either, so
+            # every run logs it as unknown_station and exits 1 forever. Naming
+            # it here is the third option that error message did not offer.
+            cur.execute(
+                "SELECT station_name FROM stations "
+                "WHERE NOT is_active AND station_name = ANY(%s) ORDER BY station_name",
+                (list(live),),
+            )
+            live_but_inactive = [r[0] for r in cur.fetchall()]
+
     print(f"seeded {len(rows)} stations from the live API")
     print(f"stations table: {total} active, {with_openaq} with an OpenAQ id")
+
+    if live_but_inactive:
+        for name in live_but_inactive:
+            print(f"  LIVE BUT INACTIVE  {name!r}", file=sys.stderr)
+        print(f"  {len(live_but_inactive)} station(s) are reporting to CPCB but marked "
+              f"is_active = FALSE. The ingester will log each one as unknown_station "
+              f"and exit non-zero on EVERY run until this is resolved. Either "
+              f"UPDATE stations SET is_active = TRUE for them, or accept the noise "
+              f"deliberately.", file=sys.stderr)
 
     if total != with_openaq:
         sys.exit(f"{total - with_openaq} station(s) have no OpenAQ id — Phase 3 needs all of them")

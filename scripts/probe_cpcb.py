@@ -1,8 +1,8 @@
 """Phase 0 / Gate 0.1 probe — throwaway.
 
 Answers one question: do at least 3 stations report PM2.5 with last_update
-inside the last 3 hours? Exits non-zero if not, so the gate is a command and
-not a vibe (build plan §0.4).
+inside the last 3 hours? Exits non-zero if not, so the gate is a command rather
+than a judgement call (build plan §0.4).
 
 Also regenerates docs/stations.md. Stdlib only — no dependencies.
 
@@ -44,6 +44,24 @@ def analyse(records: list[dict]) -> dict:
         ts = parse_bulletin_ts(any_row["last_update"])
         age_h = (now - ts).total_seconds() / 3600
         pm = pollutants.get("PM2.5")
+        # A PM2.5 row is not a PM2.5 reading. 'NA' is CPCB's null sentinel and it
+        # is live — Phase 0 measured 7 per snapshot — so a station can carry a
+        # PM2.5 row every hour and report nothing at all. has_pm25 was
+        # `pm is not None`, i.e. "the key exists", which let Gate 0.1 pass while
+        # every Haryana sensor was dark: the feed keeps emitting rows, the gate
+        # reports "30 fresh PM2.5 stations", and docs/stations.md is regenerated
+        # saying the same with a '—' in the PM2.5 column of all 30. The kill gate
+        # would have certified a data source returning no data.
+        #
+        # parse_value is guarded because it raises on a malformed value (a JSON
+        # number, or a non-finite one). Not a silent fallback (§0.5): an unusable
+        # value is counted below and printed with the gate result.
+        pm25 = None
+        if pm is not None:
+            try:
+                pm25 = parse_value(pm["avg_value"])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                pm25 = None
         rows.append(
             {
                 "station": name,
@@ -51,8 +69,8 @@ def analyse(records: list[dict]) -> dict:
                 "lat": any_row["latitude"],
                 "lon": any_row["longitude"],
                 "pollutants": sorted(pollutants),
-                "has_pm25": pm is not None,
-                "pm25": parse_value(pm["avg_value"]) if pm else None,
+                "has_pm25": pm25 is not None,
+                "pm25": pm25,
                 "last_update": any_row["last_update"],
                 "age_h": age_h,
                 # These are the silent row-droppers (§0.2). Flag, never auto-strip:
@@ -63,14 +81,33 @@ def analyse(records: list[dict]) -> dict:
         )
 
     with_pm25 = [r for r in rows if r["has_pm25"]]
-    fresh = [r for r in with_pm25 if r["age_h"] <= FRESH_HOURS]
+    # Stations that carry a PM2.5 row but no usable number. Reported so that a
+    # feed which has gone dark is legible as "30 rows, 0 readings" rather than
+    # just a smaller pass count.
+    pm25_dark = [r for r in rows if not r["has_pm25"] and "PM2.5" in r["pollutants"]]
+    # age_h is identical for every station — last_update is one national
+    # bulletin timestamp (Phase 0 correction 2). So this really measures "the
+    # national bulletin is fresh and >=3 stations report a real PM2.5 number".
+    # Per-station freshness is not available from this feed, whatever the build
+    # plan's wording implies; that has to come from value-change detection later.
+    #
+    # There is a lower bound as well as an upper one. Without a floor, a bulletin
+    # timestamp parsed with day and month swapped (DD-MM and MM-DD are
+    # indistinguishable for any day <= 12) gives a future date and a negative
+    # age, which sails through `age_h <= FRESH_HOURS` and reads as maximally
+    # fresh. Clock skew and a CPCB typo do the same. -0.5h absorbs ordinary skew.
+    fresh = [r for r in with_pm25 if -0.5 <= r["age_h"] <= FRESH_HOURS]
+    future = [r for r in rows if r["age_h"] < -0.5]
     return {
         "now": now,
         "rows": rows,
         "with_pm25": with_pm25,
+        "pm25_dark": pm25_dark,
         "fresh": fresh,
+        "future": future,
         "bulletins": Counter(r["last_update"] for r in records),
-        "na_count": sum(1 for r in records if r["avg_value"].strip() == NULL_SENTINEL),
+        "na_count": sum(1 for r in records
+                        if str(r.get("avg_value", "")).strip() == NULL_SENTINEL),
         "passed": len(fresh) >= MIN_FRESH_STATIONS,
     }
 
@@ -87,10 +124,21 @@ def render_doc(state: str, a: dict) -> str:
         "## Gate result",
         "",
         f"- Stations returned: **{len(a['rows'])}**",
-        f"- Reporting PM2.5: **{len(a['with_pm25'])}**",
+        f"- Reporting a usable PM2.5 value: **{len(a['with_pm25'])}** "
+        f"(PM2.5 row present but value unusable: {len(a['pm25_dark'])})",
         f"- Fresh (last_update <= {FRESH_HOURS}h): **{len(a['fresh'])}**",
         f"- Gate needs {MIN_FRESH_STATIONS}. **{'PASS' if a['passed'] else 'FAIL'}**",
         "",
+    ]
+    if a["future"]:
+        lines += [
+            f"> ⚠ **{len(a['future'])} row(s) carry a FUTURE `last_update`** "
+            f"(up to {-min(r['age_h'] for r in a['future']):.1f}h ahead). They are "
+            "excluded from the fresh count. Suspect an IST parse or a DD-MM/MM-DD "
+            "swap on our side before blaming CPCB.",
+            "",
+        ]
+    lines += [
         "## Corrections to the build plan found by this probe",
         "",
         "1. **Field names in build plan §4 are wrong.** The API returns `min_value`, "
@@ -146,11 +194,34 @@ def render_doc(state: str, a: dict) -> str:
             f"{r['lat']} | {r['lon']} | {len(r['pollutants'])} |"
         )
 
+    # Computed, not asserted. Printing row 0's pollutant list as a claim about
+    # all 30 means that if one station stops reporting NH3, the generated doc
+    # states the opposite of the data it was generated from.
+    sets = {tuple(r["pollutants"]) for r in a["rows"]}
+    if len(sets) == 1:
+        lines += [
+            "",
+            "All stations report the identical pollutant set: "
+            f"`{', '.join(a['rows'][0]['pollutants'])}`.",
+            "",
+        ]
+    else:
+        common = set.intersection(*(set(r["pollutants"]) for r in a["rows"]))
+        lines += [
+            "",
+            f"**Stations do NOT all report the same pollutants** — {len(sets)} "
+            f"distinct sets across {len(a['rows'])} stations. Common to all: "
+            f"`{', '.join(sorted(common)) or 'none'}`.",
+            "",
+            "| Station | Pollutants |",
+            "|---|---|",
+        ]
+        for r in a["rows"]:
+            if tuple(r["pollutants"]) != tuple(sorted(common)):
+                lines.append(f"| `{r['station']}` | {', '.join(r['pollutants'])} |")
+        lines.append("")
+
     lines += [
-        "",
-        "All stations report the identical pollutant set: "
-        f"`{', '.join(a['rows'][0]['pollutants'])}`.",
-        "",
         "## Phase 1 shortlist",
         "",
         "Postgres free tiers have row limits (§10), so Phase 1 logs a subset, not all "
@@ -191,7 +262,7 @@ def main() -> int:
     # cpcb_api.fetch raises rather than exiting, so the ingester can write a
     # fetch_log row before dying. A probe has nowhere to log, so it just exits.
     try:
-        records = fetch(args.state, load_key())
+        records, _ = fetch(args.state, load_key())
     except FetchError as e:
         sys.exit(f"{e}\nWiden to NCR before concluding there is no data source.")
 
@@ -205,7 +276,23 @@ def main() -> int:
         pm = "—" if r["pm25"] is None else f"{r['pm25']:.0f}"
         print(f"  {r['age_h']:5.1f}h  pm25={pm:>4}  {r['city']:<16} {r['station']}")
     print()
-    print(f"with PM2.5: {len(a['with_pm25'])} | fresh (<={FRESH_HOURS}h): {len(a['fresh'])}")
+    print(f"with a usable PM2.5 reading: {len(a['with_pm25'])} | "
+          f"fresh (<={FRESH_HOURS}h): {len(a['fresh'])}")
+    if a["pm25_dark"]:
+        # The row/reading distinction from analyse(), spelled out in the output
+        # so a dark feed is legible rather than just a smaller pass count.
+        print(f"PM2.5 row present but NO usable value: {len(a['pm25_dark'])} station(s)")
+        for r in a["pm25_dark"]:
+            print(f"  dark  {r['city']:<16} {r['station']}")
+    if a["future"]:
+        # Excluded from `fresh` by the lower bound, but silence would make that
+        # look like a dead feed. A future-dated bulletin is a parsing or clock
+        # bug on our side far more often than it is CPCB's, so say which.
+        worst = min(r["age_h"] for r in a["future"])
+        print(f"FUTURE-DATED bulletin: {len(a['future'])} row(s), "
+              f"up to {-worst:.1f}h ahead of now — excluded from the fresh count. "
+              f"Suspect an IST parse or a DD-MM/MM-DD swap before blaming CPCB.",
+              file=sys.stderr)
 
     if args.write_doc:
         out = os.path.join(os.path.dirname(__file__), "..", "docs", "stations.md")
