@@ -63,12 +63,21 @@ pip install -r requirements.txt
 cp .env.example .env          # then fill it in
 ```
 
-You need three things in `.env`:
+Two things in `.env` are required to run the logger:
 
 1. **`DATA_GOV_IN_API_KEY`** — data.gov.in → My Account → API Key. Use a personal key; the demo
    key from blog tutorials is rate-limited across everyone who copied it.
-2. **`OPENAQ_API_KEY`** — free signup at openaq.org. Goes in an `X-API-Key` header.
-3. **`DATABASE_URL`** — neon.tech → new project → Connect. Must end in `?sslmode=require`.
+2. **`DATABASE_URL`** — neon.tech → new project → Connect. Change the `sslmode=require`
+   Neon gives you to **`?sslmode=verify-full&sslrootcert=system`**: `require` encrypts but
+   authenticates nothing, so it does not stop anyone who can answer for the hostname from
+   collecting the password and the data.
+
+One more is optional, and only for one script:
+
+3. **`OPENAQ_API_KEY`** — free signup at openaq.org, sent in an `X-API-Key` header. Read by
+   `scripts/probe_history.py` and by nothing else, so the ingester, the gates, and every other
+   script run fine without it. It was listed as required here for long enough to be worth
+   saying plainly: skipping it costs you Gate 0.2, not the pipeline.
 
 Then:
 
@@ -168,10 +177,19 @@ Stated here rather than discovered by a reader.
   - This README previously put usage at ~31 CU-hours. That was a **projection from 48 runs/day
     that never happened** — GitHub was only delivering ~15. **Measured in the Neon console
     2026-08-10: 0.78 of 100 CU-hours since 2026-08-09**, i.e. ~16/month at the old rate.
-  - With the external trigger at 2/hour plus GitHub's cron as backup, the worst case is ~63
-    runs/day with no overlap → ~5.25 h/day → **~39 of the 100 CU-hours**. Comfortable, but the
-    figure to watch, since **exceeding it suspends the database until the next billing period**
-    — days of silent data loss rather than a slowdown.
+  - **The headroom is not yet known, and the honest reason is that the two available estimates
+    disagree by a factor of ~2.** Modelling a wake as 5 minutes at the free tier's 0.25 CU gives
+    63 runs/day → 1.31 CU-h/day → **~39 of 100**. Scaling the *measured* 0.78 instead gives
+    **~66 of 100** if that figure covered ~36 hours, and **~98** if it covered 24. The model is
+    the optimistic end of that range and this README used to quote it alone, which is exactly
+    the mistake the ~31 figure already was. The measurement is the authority; the model is not.
+  - Two terms the model omits and the measurement includes: the probes and `gate1_check.py` each
+    wake the database on their own, and a wake costs the same whether a cron or a laptop caused
+    it. That is why **a Neon connection opened to "just check something" is a real cost**, not a
+    free read.
+  - **Resolve it by re-reading the console over a known 24-hour window, not by re-projecting.**
+    Until then, treat the cap as the figure to watch, since **exceeding it suspends the database
+    until the next billing period** — days of silent data loss rather than a slowdown.
   - This is also why the ingester is *not* built as one long-lived polling job. Polling every
     few minutes inside a single run would multiply wakes, not amortise them, and would put
     usage past the cap.
