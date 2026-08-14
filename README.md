@@ -8,12 +8,12 @@ you what the air is like *right now*; this one tells a specific person whether a
 It is deliberately **not** an AQI dashboard, a map, or a city ranking. The forecast and the
 personalised threshold are the entire product.
 
-**Status: Phase 2 of 5 — the Telegram bot, deliberately with no model.** Phase 1's gate passed
-on 2026-08-13: 66 distinct bulletins, 25 of 30 stations carrying a real PM2.5 value on every
-one, 98.6% run success over 214 runs. No model yet, by design: the data source is a snapshot
-with no history, so every hour not logged is training data that can never be recovered.
-Baselines land in Phase 3 and are written into this README *before* any model exists, so the
-goalposts cannot quietly move.
+**Status: Phase 3 of 5 — the baselines.** Phase 1's gate passed on 2026-08-13: 66 distinct
+bulletins, 25 of 30 stations carrying a real PM2.5 value on every one, 98.6% run success over
+214 runs. Phase 2's passed on 2026-08-14, the day the bot went live. No model yet, by design:
+the data source is a snapshot with no history, so every hour not logged is training data that
+can never be recovered. Baselines land in Phase 3 and are written into this README *before* any
+model exists, so the goalposts cannot quietly move.
 
 ---
 
@@ -23,8 +23,8 @@ goalposts cannot quietly move.
 |---|---|---|---|
 | 0 | Kill gates: does the data exist, do the IDs join | 3+ live PM2.5 stations, mapping doc | ✅ 2026-08-09 |
 | 1 | The hourly logger | 72h of data, >95% fetch success | ✅ 2026-08-13 |
-| 2 | Telegram bot, **no model** | 3 real users, 1 feedback row | 🔨 in progress |
-| 3 | Baselines: persistence, seasonal, climatology | per-horizon table in this README | ☐ |
+| 2 | Telegram bot, **no model** | 3 real users, 1 feedback row | ✅ 2026-08-14 |
+| 3 | Baselines: persistence, seasonal, climatology | per-horizon table in this README | 🔨 in progress |
 | 4 | The model — benchmarked, not assumed | beats persistence, or a documented negative | ☐ |
 | 5 | Production discipline: drift, retraining, post-mortem | a dated real incident write-up | ☐ |
 
@@ -168,6 +168,18 @@ A warning that fires daily teaches people to ignore warnings, which then hides t
 07:00, and `scripts/check_send_window.py` re-measures the freeze on a rolling window and exits
 non-zero naming a replacement hour if 07:00 ever stops clearing 3 hours. The constant is
 checked, not remembered.
+
+### Gate 2, on the day it passed
+
+Deployed 2026-08-14. Four subscribers, four messages delivered, zero failed, four 👍 taps —
+three of each from people who are not the author. That is the gate, and it is deliberately a
+mechanical one: it tests that a stranger's tap reaches the database, not that anyone likes the
+product.
+
+**Retention is the number that matters here and it does not exist yet** — it cannot, on day
+one. A subscriber count on its own says nothing, so this README will report retention alongside
+it or drop the count entirely rather than let four look like traction. The feedback tap exists
+precisely because asking friends produces politeness, and a 👍 six weeks from now will not.
 
 ---
 
