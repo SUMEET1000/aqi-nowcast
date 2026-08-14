@@ -1,4 +1,4 @@
--- AQI Nowcast — Phase 1 schema.
+-- AQI Nowcast — Phase 1 and Phase 2 schema.
 --
 -- Applied by scripts/init_db.py. Every statement is IF NOT EXISTS, so running
 -- it twice is a no-op and never destroys data. There is no DROP in this file
@@ -140,3 +140,149 @@ CREATE INDEX IF NOT EXISTS fetch_log_run_ts_idx ON fetch_log (run_ts DESC);
 -- OpenAQ id is still permitted.
 CREATE UNIQUE INDEX IF NOT EXISTS stations_openaq_location_id_key
     ON stations (openaq_location_id);
+
+
+-- ---------------------------------------------------------------------------
+-- Phase 2 — the bot. Everything below is written by the Telegram Worker in
+-- bot/ or by scripts/send_alerts.py.
+
+
+-- profiles — who a subscriber is, as config rather than as branching code.
+--
+-- Build plan §1: "The profile is a row in a config table, never hardcoded
+-- branching logic. Adding a fourth profile later must be a row insert, not a
+-- refactor." Seeded by scripts/seed_profiles.py.
+CREATE TABLE IF NOT EXISTS profiles (
+    -- The slug from build plan §1: 'asthma_child' | 'copd_elderly' |
+    -- 'outdoor_worker'. A TEXT primary key rather than a serial, because it
+    -- travels inside a Telegram callback_data string (limit 64 bytes) and a
+    -- readable value there is what makes a bad tap diagnosable from a log line.
+    --
+    -- Deviation from PHASE2_PLAN.md, which listed both `name` and `label`:
+    -- with a slug as the key, `name` would be a third copy of the same string.
+    profile_id      TEXT PRIMARY KEY,
+
+    -- What the button says.
+    label           TEXT NOT NULL,
+
+    -- Shown when picking, and in /about. Describes who the profile is for —
+    -- never health guidance. All health wording in this product is CPCB's,
+    -- quoted with its citation (build plan §5).
+    description     TEXT NOT NULL,
+
+    -- Populated now, UNUSED until Phase 4. A threshold alert on a current
+    -- reading only restates what is already out of the window; what makes one
+    -- useful is firing before the bad air arrives, which needs a forecast. The
+    -- columns exist so switching that on is an INSERT and a code path, not a
+    -- migration on a live table.
+    threshold_pm25  DOUBLE PRECISION NOT NULL,
+    cooldown_hours  INTEGER          NOT NULL
+);
+
+
+-- subscribers — chat ID, station, profile. Nothing else, ever.
+--
+-- Build plan §5: "Store only: Telegram chat ID, chosen station, chosen
+-- profile. No coordinates, no names, no health records. Under DPDP, the less
+-- we hold the less we owe." A first_name or username column would be trivial
+-- to add and is exactly what this line forbids.
+CREATE TABLE IF NOT EXISTS subscribers (
+    -- BIGINT, not INTEGER. Telegram chat ids for users created since ~2021
+    -- exceed 2^31, and a group id is negative and larger still. An INTEGER
+    -- here fails at signup for newer accounts only — a bug that looks like
+    -- "the bot works for me".
+    chat_id      BIGINT      PRIMARY KEY,
+
+    station_id   INTEGER     NOT NULL REFERENCES stations(station_id),
+    profile_id   TEXT        NOT NULL REFERENCES profiles(profile_id),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- /pause stops the daily message and keeps the row. /stop deletes the row
+    -- outright — a person asking to be removed is removed, not flagged.
+    is_paused    BOOLEAN     NOT NULL DEFAULT FALSE
+);
+
+
+-- sent_log — one row per message actually delivered.
+--
+-- Two jobs. It stops a double-send when the sender is re-run or the workflow
+-- fires twice, and it is the only place retention is measurable at Gate 2
+-- ("N subscribers, Z% still active at week 8" — build plan §9.3).
+CREATE TABLE IF NOT EXISTS sent_log (
+    id             BIGSERIAL   PRIMARY KEY,
+    chat_id        BIGINT      NOT NULL,
+    sent_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- The IST calendar date this message counts as, computed by the sender.
+    --
+    -- A separate column rather than an expression index on sent_at, because
+    -- `sent_at AT TIME ZONE 'Asia/Kolkata'` is STABLE, not IMMUTABLE — Postgres
+    -- refuses it in an index, since the tz database can change underneath it.
+    -- Storing the date the sender decided on also means a run that starts at
+    -- 06:59:58 IST and finishes at 07:00:01 cannot straddle two dates.
+    send_date      DATE        NOT NULL,
+
+    -- What the message actually said, so a complaint about a number is
+    -- answerable. NULL observation_ts/pm25_value is the dark-station message.
+    --
+    -- station_id is stored rather than read back through subscribers, because
+    -- a subscriber can change station or leave: without it, a feedback tap on
+    -- last week's message would attach to this week's station, or to no
+    -- station at all.
+    station_id     INTEGER     REFERENCES stations(station_id),
+    observation_ts TIMESTAMPTZ,
+    pm25_value     DOUBLE PRECISION,
+    overall_aqi    INTEGER,
+    band           TEXT,
+
+    -- One message per subscriber per IST day. This is the constraint the
+    -- double-send guard rests on: the sender checks first, but a check plus a
+    -- unique index is the pair that survives two runs racing.
+    UNIQUE (chat_id, send_date)
+);
+
+
+-- feedback — the 👍/👎 tap under each message.
+--
+-- Build plan §5: behavioural data instead of social data. Friends say "cool"
+-- when asked; they do not tap 👍 out of politeness for six weeks. Gate 2 needs
+-- at least one row here.
+CREATE TABLE IF NOT EXISTS feedback (
+    id          BIGSERIAL   PRIMARY KEY,
+
+    -- Which message was rated. Written by the bot Worker from the callback
+    -- data, which carries this id.
+    sent_log_id BIGINT      NOT NULL REFERENCES sent_log(id),
+
+    -- Deliberately NOT a foreign key to subscribers. /stop deletes that row,
+    -- and a person leaving must not delete the record that they once found a
+    -- message useful — that record is the retention measurement.
+    chat_id     BIGINT      NOT NULL,
+
+    -- 1 or -1. Not an ENUM and not a CHECK, following the convention above:
+    -- fetch_log.outcome and observations.pollutant_id are both unconstrained
+    -- because rejecting an unanticipated value loses the row that would have
+    -- explained it. A third rating would be a product decision, not a defect.
+    rating      SMALLINT    NOT NULL,
+
+    -- Copied from the sent_log row at tap time so feedback reads on its own —
+    -- "which station and what number did they rate" without a join.
+    station_id  INTEGER     REFERENCES stations(station_id),
+    pm25_value  DOUBLE PRECISION,
+
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- A second tap on the same message replaces the first (the Worker upserts
+    -- on this). Without it, one person tapping 👍 twenty times reads as twenty
+    -- pieces of evidence at Gate 2, which would make the gate meaningless in
+    -- the direction that flatters us.
+    UNIQUE (sent_log_id, chat_id)
+);
+
+
+-- The sender's one hot query: "has this subscriber already had today's
+-- message?" The UNIQUE (chat_id, send_date) above already provides the index,
+-- so nothing further is added here. The station picker's liveness query reads
+-- observations at the newest bulletin, which the observations PRIMARY KEY
+-- serves.
+
