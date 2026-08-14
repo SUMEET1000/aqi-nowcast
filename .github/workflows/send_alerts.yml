@@ -1,0 +1,114 @@
+# The Phase 2 daily alert. One message per subscriber, once a day, 07:00 IST.
+#
+# Unlike ingest.yml, a missed run here is recoverable in principle — the reading
+# still exists tomorrow — but it is not recoverable in practice: yesterday's air
+# is not what anyone needs to know about, and a bot that skips two mornings in
+# three is a bot people stop opening. Gate 2 is measured in retention.
+name: send_alerts
+
+on:
+  # 01:30 UTC is 07:00 IST. The hour is not arbitrary and not remembered: CPCB's
+  # feed freezes every morning, so the last bulletin before this is 05:00 IST and
+  # the next is between 10:00 and 13:00. At 07:00 the reading is 2.0h old; at
+  # 09:00 it is 4.0h and every message would carry a staleness warning, every
+  # day, which teaches people to ignore warnings. scripts/check_send_window.py
+  # re-measures that window on this same schedule and fails when 07:00 stops
+  # clearing the 3h rule, naming the replacement hour.
+  #
+  # This is the BACKUP trigger, exactly as in ingest.yml. GitHub delivered 11 of
+  # ~36 requested ticks over 18 hours on this repo, all 15-22 minutes late. The
+  # primary is the Cloudflare Worker in trigger/, which fires a workflow_dispatch
+  # at the same time and lands in 0 seconds. Both may fire: sent_log's
+  # UNIQUE (chat_id, send_date) and the check above it make the second one a
+  # no-op rather than a second message.
+  #
+  # Changing this cron means changing SEND_HOUR in scripts/check_send_window.py
+  # too — this one is UTC, that one is IST.
+  schedule:
+    - cron: '30 1 * * *'
+
+  workflow_dispatch:
+
+concurrency:
+  group: send_alerts
+  cancel-in-progress: false
+
+# Same reasoning as ingest.yml: `contents: read` and not `{}`, because
+# actions/checkout authenticates its clone with GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    # Shorter than ingest.yml's 15: there is no CPCB fetch here. Worst case is
+    # connect() at 3 x 15s plus one Telegram call per subscriber at 3 x 30s.
+    timeout-minutes: 10
+
+    steps:
+      # SHA-pinned for the reason ingest.yml gives: a major tag is a branch
+      # GitHub can move, and a moved tag gets code execution in this job just
+      # before TELEGRAM_BOT_TOKEN enters it. That token can read every
+      # subscriber's messages and send as us.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      - name: Install frozen dependencies
+        run: pip install -r requirements.txt
+
+      # Same argument as ingest.yml's preflight: from outside the job, a missing
+      # token and an unreachable database look identical, and the Actions log
+      # download returns 403 without admin rights even on a public repo.
+      # Presence, length and shape only — never a value.
+      - name: Preflight — check secrets are present and well-formed
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          status=0
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL is empty. Add it under Settings -> Secrets and variables -> Actions -> Repository secrets."
+            status=1
+          else
+            echo "DATABASE_URL: present (${#DATABASE_URL} chars)"
+          fi
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN is empty. @BotFather issues it; the same value goes into the bot Worker as a Cloudflare secret."
+            status=1
+          else
+            echo "TELEGRAM_BOT_TOKEN: present (${#TELEGRAM_BOT_TOKEN} chars)"
+            # A bot token is '<numeric id>:<35-char secret>'. A truncated paste
+            # or a copied placeholder fails this before a single message is
+            # attempted, rather than as a 401 per subscriber.
+            case "$TELEGRAM_BOT_TOKEN" in
+              *:*) echo "  shape: ok" ;;
+              *) echo "::error::TELEGRAM_BOT_TOKEN has no ':' — it is not a bot token."; status=1 ;;
+            esac
+          fi
+          exit $status
+
+      - name: Send
+        env:
+          PYTHONUNBUFFERED: "1"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python scripts/send_alerts.py
+
+      # After the send, never before. This check failing means the send TIME is
+      # wrong, not that today's message should be withheld — running it first
+      # would turn a scheduling drift into a day of silence.
+      #
+      # `if: always()` so it still runs when the send failed: "did anyone get a
+      # message" and "is 07:00 still the right hour" are independent questions.
+      - name: Is 07:00 IST still fresh?
+        if: always()
+        env:
+          PYTHONUNBUFFERED: "1"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/check_send_window.py
