@@ -15,7 +15,8 @@ SCHEMA = os.path.join(os.path.dirname(__file__), "..", "db", "schema.sql")
 
 # Everything the schema is supposed to create. Checked after applying, so a
 # partial apply fails here rather than in the next scheduled ingest (§0.5).
-EXPECTED_TABLES = ("stations", "observations", "fetch_log")
+EXPECTED_TABLES = ("stations", "observations", "fetch_log",
+                   "profiles", "subscribers", "sent_log", "feedback")
 
 
 def main() -> int:

@@ -53,6 +53,11 @@ graphify-out/
 #                every mistake made here in the first person, for recall rather
 #                than for publication; the README is the public account of the
 #                same work.
+#   PHASE2_PLAN.md  the agreed Phase 2 design, written to be handed to a fresh
+#                agent session. Scaffolding for building, not a deliverable.
+#                Root rather than docs/, because docs/ is otherwise entirely
+#                published and one ignored file inside it is a trap for a
+#                future push. Delete it once Gate 2 passes.
 #
 # They stay on disk and remain the authority for how the project is built. They
 # are just not part of what is published.
@@ -60,6 +65,12 @@ graphify-out/
 CLAUDE.md
 IDEAS.md
 PROGRESS.md
+PHASE2_PLAN.md
+
+# Session handoffs written by the `handoff` skill. Same family as the files
+# above: scaffolding for building, not a deliverable, and they quote the
+# private ones. The whole directory, because there is one file per session.
+Handoff/
 
 # OS / editor
 .DS_Store
