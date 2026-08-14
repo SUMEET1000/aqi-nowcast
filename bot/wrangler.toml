@@ -1,0 +1,53 @@
+# The Telegram bot. Takes taps, writes rows, and nothing else.
+#
+# It contains no breakpoint table, no sub-index arithmetic and no message
+# wording. All of that is Python in scripts/aqi.py, next to its tests and next
+# to where Phase 4 needs the identical numbers — the same table written in two
+# languages goes stale in one of them.
+#
+# Separate from trigger/ on purpose. trigger/ holds a GitHub PAT and has no
+# public address; this Worker is internet-facing by definition, because a
+# Telegram webhook is a URL anyone can POST to. They share no secret.
+#
+# Deploy:
+#   cd bot && npm ci && npx wrangler deploy
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN
+#   npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+#   npx wrangler secret put DATABASE_URL
+#
+# Then register the webhook (once), from a shell, not from here:
+#   curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+#        -H 'content-type: application/json' \
+#        -d '{"url":"https://aqi-nowcast-bot.<subdomain>.workers.dev",
+#             "secret_token":"<the same TELEGRAM_WEBHOOK_SECRET>"}'
+
+name = "aqi-nowcast-bot"
+main = "src/index.js"
+compatibility_date = "2026-08-13"
+
+# This one DOES need a public URL — Telegram delivers updates by POSTing to it.
+# That is what makes the secret-token check in src/index.js load-bearing rather
+# than defensive: without it, anyone who guesses this URL can create
+# subscriptions and forge feedback taps.
+workers_dev = true
+
+# nodejs_compat is required by @neondatabase/serverless, which reaches for
+# node:buffer and node:events.
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# Fires send_alerts.yml when someone subscribes, so their first message arrives
+# now rather than tomorrow morning.
+#
+# A service binding and not a GitHub PAT in this Worker. trigger/ already holds
+# that token and has no public address; this Worker is a URL anyone can POST at,
+# and a token that can start workflow runs does not belong there. The binding is
+# internal Cloudflare routing — it does not give trigger/ an address either.
+#
+# trigger/ must be deployed before this Worker, or the deploy fails on an
+# unknown service.
+[[services]]
+binding = "TRIGGER"
+service = "aqi-nowcast-trigger"

@@ -57,4 +57,13 @@ enabled = true
 # hour is actively risky: a bulletin stamped H:30 appears on the feed anywhere
 # from H+0:32 to H+1:04, so a single fixed poll can sit in the wrong half of that
 # drift and miss one entirely.
-crons = ["5,35 * * * *"]
+#
+# The second cron is Phase 2's daily alert at 01:30 UTC = 07:00 IST, dispatching
+# send_alerts.yml instead of ingest.yml. src/index.js maps cron -> workflow by
+# the exact string, so these two files have to agree character for character.
+#
+# It lives in this Worker rather than in the bot Worker because this one holds
+# the GitHub PAT and has no public address; bot/ is internet-facing by
+# definition, and a token that can start workflow runs does not belong behind a
+# webhook anyone can POST to.
+crons = ["5,35 * * * *", "30 1 * * *"]

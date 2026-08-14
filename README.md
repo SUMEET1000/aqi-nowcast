@@ -8,10 +8,12 @@ you what the air is like *right now*; this one tells a specific person whether a
 It is deliberately **not** an AQI dashboard, a map, or a city ranking. The forecast and the
 personalised threshold are the entire product.
 
-**Status: Phase 1 of 5 — the ingestion pipeline.** No model yet, by design: the data source is
-a snapshot with no history, so every hour not logged is training data that can never be
-recovered. Baselines land in Phase 3 and are written into this README *before* any model
-exists, so the goalposts cannot quietly move.
+**Status: Phase 2 of 5 — the Telegram bot, deliberately with no model.** Phase 1's gate passed
+on 2026-08-13: 66 distinct bulletins, 25 of 30 stations carrying a real PM2.5 value on every
+one, 98.6% run success over 214 runs. No model yet, by design: the data source is a snapshot
+with no history, so every hour not logged is training data that can never be recovered.
+Baselines land in Phase 3 and are written into this README *before* any model exists, so the
+goalposts cannot quietly move.
 
 ---
 
@@ -20,8 +22,8 @@ exists, so the goalposts cannot quietly move.
 | Phase | What | Gate | Status |
 |---|---|---|---|
 | 0 | Kill gates: does the data exist, do the IDs join | 3+ live PM2.5 stations, mapping doc | ✅ 2026-08-09 |
-| 1 | The hourly logger | 72h of data, >95% fetch success | 🔨 in progress |
-| 2 | Telegram bot, **no model** | 3 real users, 1 feedback row | ☐ |
+| 1 | The hourly logger | 72h of data, >95% fetch success | ✅ 2026-08-13 |
+| 2 | Telegram bot, **no model** | 3 real users, 1 feedback row | 🔨 in progress |
 | 3 | Baselines: persistence, seasonal, climatology | per-horizon table in this README | ☐ |
 | 4 | The model — benchmarked, not assumed | beats persistence, or a documented negative | ☐ |
 | 5 | Production discipline: drift, retraining, post-mortem | a dated real incident write-up | ☐ |
@@ -44,7 +46,31 @@ GitHub Actions cron (:13, :43) ────┘        job                  │  
                                                                  ▼              stations
                                                           idempotent upsert
                                                     keyed on the bulletin timestamp
+
+Phase 2, reading the same database:
+
+Cloudflare Worker cron (01:30 UTC = 07:00 IST)
+        │  workflow_dispatch
+        ▼
+GitHub Actions ─▶ scripts/send_alerts.py ─▶ Telegram ─▶ one message per subscriber
+                  PM2.5 + CPCB's advisory                    👍 / 👎
+                  for the overall AQI band                     │
+                                                               ▼
+Telegram ──webhook──▶ Cloudflare Worker (bot/) ────────▶ Neon: subscribers, feedback
+   /start, station, profile          takes taps, writes rows — no arithmetic
+                                              │
+                                              │  service binding (internal, no public URL)
+                                              ▼
+                                   Cloudflare Worker (trigger/) ─▶ same send, immediately
+                                   holds the GitHub token
 ```
+
+Subscribing fires that day's message straight away rather than leaving someone with nothing
+until the next morning. It goes through `trigger/` rather than from `bot/` directly because
+`bot/` is a public webhook URL and the GitHub token can start any workflow in this repo — one
+that would run with the database credentials in scope. The send needs no "just this person"
+argument: `send_alerts.py` skips anyone who already has a message for today, so an extra run
+is a no-op for everybody else.
 
 The ingester runs on GitHub Actions rather than inside a web service on purpose: a free web
 dyno sleeps after 15 minutes idle and its cron dies silently.
@@ -88,6 +114,20 @@ python scripts/ingest.py         # one manual run
 python tests/test_null_guard.py  # prove a null can never erase a reading
 ```
 
+For Phase 2 (the bot), add `TELEGRAM_BOT_TOKEN` from
+[@BotFather](https://t.me/botfather) and:
+
+```bash
+python scripts/seed_profiles.py             # three profiles, idempotent
+python tests/test_aqi.py                    # CPCB's worked examples: 31→51, 45→75, 60→100
+python tests/test_message.py                # the message a person actually reads
+python scripts/send_alerts.py --dry-run     # render every station, send nothing
+python scripts/check_send_window.py         # is 07:00 IST still fresh enough?
+```
+
+The chat side is a separate Cloudflare Worker — see [`bot/`](bot/) for the deploy steps and
+the webhook secret.
+
 To run it unattended, push to GitHub and add `DATA_GOV_IN_API_KEY` and `DATABASE_URL` under
 Settings → Secrets and variables → Actions. That alone gets you GitHub's own cron, which is
 throttled on a new repository — see [`trigger/`](trigger/) to add the external clock that
@@ -103,6 +143,31 @@ python scripts/gate1_check.py                  # Gate 1, run 72h after go-live
 
 `docs/stations.md` and `docs/station_mapping.md` are **generated**. Never hand-edit them; re-run
 the script with `--write-doc`.
+
+---
+
+## The daily message, and why it goes out at 07:00 IST
+
+One message per subscriber per day: the PM2.5 at their station in µg/m³ and its band, then
+CPCB's own health statement for the **overall** AQI band, quoted and cited. No forecast yet —
+Phase 2 sends current readings only, and a threshold alert on a current reading would just
+restate what is already out of the window.
+
+The send time is measured, not chosen. **CPCB's feed freezes every morning**: over four days
+the last morning bulletin was 05:00 IST and the next arrived between 10:00 and 13:00, with no
+exceptions. Against the rule that a reading over 3 hours old must be flagged as stale, that
+makes the hour load-bearing:
+
+| Send at | Newest bulletin | Age | Result |
+|---|---|---|---|
+| 07:00 IST | 05:00 | 2.0h | clean |
+| 08:00 IST | 05:00 | 3.0h | on the line |
+| 09:00 IST | 05:00 | 4.0h | a staleness warning every single day |
+
+A warning that fires daily teaches people to ignore warnings, which then hides the real one. So
+07:00, and `scripts/check_send_window.py` re-measures the freeze on a rolling window and exits
+non-zero naming a replacement hour if 07:00 ever stops clearing 3 hours. The constant is
+checked, not remembered.
 
 ---
 
@@ -144,11 +209,23 @@ Stated here rather than discovered by a reader.
   documented and enforced in code, not left to judgement.
 - A CPCB-comparable AQI needs a 24h window (8h for O₃ and CO) with ≥16h of data across ≥3
   pollutants, so it cannot come from one reading. Whether the API's `avg_value` is *already*
-  such an average — which would make it computable from a single bulletin — is **being measured
-  rather than assumed**: `scripts/probe_avg_window.py` tries to disprove it from the logged
-  history and reports per pollutant. As of 2026-08-10 it **withholds a verdict** on sample size
-  (12 bulletins; it wants 24 over 24h). Either way the headline number stays **PM2.5 in µg/m³
-  and its band**. See `docs/cpcb_aqi_breakpoints.md`.
+  such an average — which would make it computable from a single bulletin — is **measured rather
+  than assumed**: `scripts/probe_avg_window.py` tries to disprove it two ways from the logged
+  history and reports per pollutant. On 2026-08-11, over 26 bulletins and 40 hours, it was **not
+  disproved** for any of the seven pollutants. That is a failure to reject, not a confirmation:
+  the two tests share one `[min, max]` envelope so they are not independent, and the more
+  powerful of them could only have caught a violation in 20% of PM2.5 pairs. **The bot therefore
+  runs on an assumption, recorded with its date and sample size**, not on a settled fact. Either
+  way the headline number stays **PM2.5 in µg/m³ and its band**. See
+  `docs/cpcb_aqi_breakpoints.md`.
+- **CO is left out of the overall AQI, because its unit in the feed is unknown.** CPCB's
+  breakpoints expect mg/m³; the feed reports CO with a median of 31 and no unit field anywhere
+  in the response. Read as mg/m³ that makes CO the worst pollutant in 93.3% of 2,097
+  station-hours and puts the median overall AQI at 382 (Very Poor) against 104 (Moderate)
+  without it — and CPCB's own published Haryana AQI in August is nothing like Very Poor, so
+  mg/m³ is disproved by its consequence. What the unit *is* remains open, so the honest move is
+  to score six pollutants rather than seven and say so. CPCB's ≥3-pollutant rule is still met
+  comfortably.
 
 **Infrastructure**
 - **GitHub's `schedule:` trigger is throttled on this repository, and the cron is not the

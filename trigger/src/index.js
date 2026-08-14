@@ -1,4 +1,5 @@
-// Fires scripts/ingest.py by asking GitHub to run the `ingest` workflow.
+// Fires this repo's workflows by asking GitHub to run them, on a cron GitHub
+// does not throttle.
 //
 // This file holds no secret. The GitHub token lives only as an encrypted Worker
 // secret (`wrangler secret put GH_PAT`) and is never in the repo, never printed,
@@ -6,7 +7,20 @@
 
 const OWNER = "SUMEET1000";
 const REPO = "aqi-nowcast";
-const WORKFLOW = "ingest.yml";
+
+// Which cron fires which workflow. Keyed by the exact schedule strings in
+// wrangler.toml — Cloudflare hands the matched one back as event.cron, so the
+// two files have to agree character for character.
+//
+// The daily send is here for the same reason ingestion is: GitHub's scheduled
+// queue delivered 11 of ~36 requested ticks on this repo. A twice-hourly job
+// survives that by running again; a once-a-day job does not — it is simply
+// missing on most mornings, and Gate 2 is measured in whether people keep
+// opening the message.
+const WORKFLOWS = {
+  "5,35 * * * *": "ingest.yml",
+  "30 1 * * *": "send_alerts.yml", // 07:00 IST
+};
 
 // The workflow-dispatch endpoint, deliberately, rather than
 // repository-dispatch. repository_dispatch needs a token with
@@ -18,8 +32,8 @@ const WORKFLOW = "ingest.yml";
 //
 // workflow_dispatch needs only `Actions: write`, which can start a run and
 // nothing else. Same result, far smaller blast radius if the token ever leaks.
-const ENDPOINT =
-  `https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/dispatches`;
+const endpoint = (workflow) =>
+  `https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${workflow}/dispatches`;
 
 // Three attempts, ~1s then ~2s apart. This Worker is the only trigger that
 // fires on time — GitHub's own cron is throttled to ~31% delivery and 15-22 min
@@ -32,8 +46,8 @@ const ATTEMPTS = 3;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function attemptDispatch(env) {
-  const res = await fetch(ENDPOINT, {
+async function attemptDispatch(env, workflow) {
+  const res = await fetch(endpoint(workflow), {
     method: "POST",
     headers: {
       Authorization: `Bearer ${env.GH_PAT}`,
@@ -62,16 +76,17 @@ async function attemptDispatch(env) {
   // Marked non-retryable so the error surfaces on the first attempt with the
   // real status still attached, instead of as three identical failures.
   const permanent = res.status === 401 || res.status === 403 || res.status === 404;
-  const err = new Error(`dispatch failed: HTTP ${res.status} ${await res.text()}`);
+  const err = new Error(
+    `dispatch of ${workflow} failed: HTTP ${res.status} ${await res.text()}`);
   err.permanent = permanent;
   throw err;
 }
 
-async function dispatch(env) {
+async function dispatch(env, workflow) {
   let last;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     try {
-      return await attemptDispatch(env);
+      return await attemptDispatch(env, workflow);
     } catch (e) {
       last = e;
       // A network-level rejection has no .permanent, so it retries — that is
@@ -104,6 +119,26 @@ export default {
   // only as an unhandled rejection. Awaiting makes a failed dispatch fail the
   // invocation, which is the whole point of throwing above (§0.5).
   async scheduled(event, env, ctx) {
-    await dispatch(env);
+    const workflow = WORKFLOWS[event.cron];
+    // Throwing rather than defaulting to ingest.yml (§0.5). A cron in
+    // wrangler.toml with no entry here means the two files drifted apart, and
+    // silently ingesting on the send's schedule would hide that for weeks.
+    if (!workflow) throw new Error(`no workflow mapped for cron ${event.cron}`);
+    await dispatch(env, workflow);
+  },
+
+  // Reachable only over a Cloudflare service binding from bot/ — this Worker has
+  // workers_dev = false and no routes, so there is no URL to POST at from the
+  // internet. That is the whole point: bot/ needs a send fired when someone
+  // subscribes, and this is how it gets one without the GitHub PAT moving into
+  // an internet-facing process.
+  //
+  // No inputs. send_alerts.py sends to every unpaused subscriber with no
+  // sent_log row for today, so a run started by a new subscription is a no-op
+  // for everyone who already has their message.
+  async fetch(request, env) {
+    if (request.method !== "POST") return new Response("not found", { status: 404 });
+    await dispatch(env, "send_alerts.yml");
+    return new Response("ok");
   },
 };
