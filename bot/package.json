@@ -1,0 +1,17 @@
+{
+  "name": "aqi-nowcast-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker handling the Telegram chat: /start, station pick, profile pick, feedback tap.",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "1.1.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.120.1"
+  }
+}
