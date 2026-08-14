@@ -118,6 +118,37 @@ Note the **Severe band is unbounded above** (`250+` for PM2.5) while the index c
 Concentrations above the top breakpoint must clamp to 500, not extrapolate. Gurugram routinely
 exceeds 250 µg/m³ in November, so this path *will* be hit.
 
+### CO's unit in the feed is unknown, so CO is excluded from the overall AQI
+
+Measured 2026-08-13. The table above expects CO in **mg/m³**, where 34+ is the top of the
+scale. The data.gov.in feed reports CO values with a median of **31** and a range of **6–103**,
+and **the response carries no unit field for any pollutant** — the eleven keys are `country`,
+`state`, `city`, `station`, `last_update`, `latitude`, `longitude`, `pollutant_id`,
+`min_value`, `max_value`, `avg_value`.
+
+Read as mg/m³, over 2097 station-hours in `observations`:
+
+| | |
+|---|---|
+| CO is the worst sub-index | **93.3%** of station-hours |
+| CO sub-index clamped at 500 | **38.6%** |
+| median overall AQI **with** CO | **382 (Very Poor)** |
+| median overall AQI **without** CO | **104 (Moderate)** |
+
+CPCB's own published AQI for Haryana in August is nothing like Very Poor, so **mg/m³ is
+disproved by its consequence.** What the unit actually *is* stays open — a median of 31 would
+be plausible as 3.1 mg/m³, but a hypothesis that fits is not a measurement, and this number
+selects the health sentence a subscriber reads.
+
+`aqi.EXCLUDED_FROM_OVERALL = ("CO",)` therefore drops it, **before** the ≥3-pollutant count
+rather than after, so it cannot satisfy a quorum it contributes nothing to. Six pollutants
+remain, so the rule is still met comfortably. `sub_index("CO", …)` still exists and is still
+tested — only the overall AQI excludes it.
+
+**To settle it:** take a Haryana city on a given day, compute our overall AQI from
+`observations` both with and without CO, and compare against the same day's CPCB Daily AQI
+Bulletin. Whichever matches names the unit. Then delete the constant.
+
 ## Sub-index formula
 
 Piecewise-linear interpolation within the band:
