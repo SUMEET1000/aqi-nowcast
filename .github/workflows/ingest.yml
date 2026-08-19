@@ -61,7 +61,10 @@ jobs:
     # plus a slow Neon wake can cross 10 minutes, and a run killed by the
     # timeout is SIGKILLed, so it writes no fetch_log row and is invisible to
     # Gate 1: the exact hole ingest.run() exists to close.
-    timeout-minutes: 15
+    #
+    # 20 rather than 15 since the OpenAQ step joined: 30 stations at ~4 throttled
+    # requests each is ~2.5 min on a good run, and its own retries can stretch it.
+    timeout-minutes: 20
 
     steps:
       # Pinned to commit SHAs, not to v5/v6, because a major tag is a branch
@@ -135,10 +138,10 @@ jobs:
             case "$DATABASE_URL" in
               *sslmode=verify-full*|*sslmode=verify-ca*) echo "  sslmode: verifying, ok" ;;
               *sslmode=disable*|*sslmode=allow*|*sslmode=prefer*)
-                echo "::error::DATABASE_URL permits an unencrypted connection. Use ?sslmode=verify-full&sslrootcert=system"; status=1 ;;
+                echo "::error::DATABASE_URL permits an unencrypted connection. Use ?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"; status=1 ;;
               *sslmode=require*)
-                echo "::warning::sslmode=require encrypts but does NOT verify the server certificate. Migrate to ?sslmode=verify-full&sslrootcert=system" ;;
-              *) echo "::warning::DATABASE_URL has no sslmode — expected ?sslmode=verify-full&sslrootcert=system" ;;
+                echo "::warning::sslmode=require encrypts but does NOT verify the server certificate. Migrate to ?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt" ;;
+              *) echo "::warning::DATABASE_URL has no sslmode — expected ?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt" ;;
             esac
           fi
           exit $status
@@ -157,6 +160,24 @@ jobs:
           DATA_GOV_IN_API_KEY: ${{ secrets.DATA_GOV_IN_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/ingest.py
+
+      # OpenAQ carries the same CPCB sensors as real µg/m³, and the live feed
+      # does not: measured 2026-08-19, observations.value_avg is CPCB's AQI
+      # sub-index, so without this step the product has no concentration to
+      # report at all. It is also the fresher source at send time — CPCB freezes
+      # between 05:00 and about 11:00 IST while OpenAQ keeps publishing 06:00 to
+      # 09:00, which is exactly when the 07:00 alert goes out.
+      #
+      # After Ingest, not before: CPCB's bulletin is the unrecoverable one, and
+      # a failure here must not cost it. OpenAQ is an archive that is still
+      # there on the next run, which is also why a two-day window rather than
+      # one hour — a missed run heals itself instead of leaving a hole.
+      - name: Pull OpenAQ hourly PM2.5
+        env:
+          PYTHONUNBUFFERED: "1"
+          OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/backfill_openaq.py --since "$(date -u -d '2 days ago' +%F)"
 
 # Two GitHub behaviours worth designing around rather than discovering later.
 # GitHub disables scheduled workflows on a repository with 60 days of no
