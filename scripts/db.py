@@ -113,16 +113,16 @@ def check_sslmode(url: str) -> None:
     mode = _sslmode_of(url)
     if mode is None:
         print("  warning: DATABASE_URL has no sslmode — expected "
-              "?sslmode=verify-full&sslrootcert=system", file=sys.stderr)
+              "?sslmode=verify-full&sslrootcert=<CA bundle>", file=sys.stderr)
     elif mode in UNVERIFIED_SSLMODES:
         sys.exit(f"DATABASE_URL has sslmode={mode}, which permits an "
                  f"unencrypted connection. Neon requires TLS and so do we. "
-                 f"Use ?sslmode=verify-full&sslrootcert=system")
+                 f"Use ?sslmode=verify-full&sslrootcert=<CA bundle>")
     elif mode not in VERIFYING_SSLMODES:
         print(f"  warning: sslmode={mode} ENCRYPTS BUT DOES NOT VERIFY the "
               f"server certificate — an attacker who can answer for this "
               f"hostname sees the password and every row. Migrate to "
-              f"?sslmode=verify-full&sslrootcert=system", file=sys.stderr)
+              f"?sslmode=verify-full&sslrootcert=<CA bundle>", file=sys.stderr)
 
 
 def connect(url: str | None = None) -> psycopg.Connection:
