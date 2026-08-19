@@ -21,8 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 # be pulled in here or the µg/m³ in the labels below prints as '?' (see env.py).
 import env  # noqa: E402, F401
 from aqi import (ADVISORY, ADVISORY_LONG, BANDS,  # noqa: E402
-                 EXCLUDED_FROM_OVERALL, band_of_index, overall_aqi,
-                 pm25_band, sub_index)
+                 band_of_index, overall_aqi, pm25_band, sub_index)
 
 failures = 0
 
@@ -97,19 +96,35 @@ print()
 
 print("CPCB's >=3-pollutant rule is enforced, and a refusal carries its reason:")
 
-overall, reason = overall_aqi({"PM2.5": 72.0, "PM10": 140.0, "NO2": 30.0})
+# These inputs are observations.value_avg, which the feed publishes as CPCB
+# SUB-INDICES rather than concentrations (measured 2026-08-19 by
+# scripts/compare_sources.py). So the numbers below are already index values and
+# the overall AQI is the worst of them, untouched.
+overall, reason = overall_aqi({"PM2.5": 139.0, "PM10": 120.0, "NO2": 45.0})
 check("three pollutants with PM2.5 -> an AQI", (overall.aqi, overall.band),
       (139, "Moderate"))
-check("the AQI is the worst sub-index, not an average",
-      overall.aqi, max(sub_index("PM2.5", 72.0), sub_index("PM10", 140.0),
-                       sub_index("NO2", 30.0)))
+check("the AQI is the worst sub-index, not an average", overall.aqi, 139)
 check("the dominant pollutant is named", overall.dominant, "PM2.5")
 check("no refusal reason when it computed", reason, None)
+
+# THE regression. Until 2026-08-19 overall_aqi ran each value_avg through
+# sub_index a second time, so a feed value of 157 — a true AQI of 157, which is
+# Moderate — was read as 157 µg/m³ and came back 301+, Very Poor. That band
+# selected the health sentence a subscriber read, so the bug was worst exactly
+# where it mattered. Both halves are checked: the right answer, and the specific
+# wrong one.
+overall, _ = overall_aqi({"PM2.5": 157.0, "PM10": 100.0, "NO2": 50.0})
+check("a feed value of 157 is an AQI of 157", overall.aqi, 157)
+check("and its band is Moderate", overall.band, "Moderate")
+check("NOT the Very Poor that double-applying the table produced",
+      overall.band != "Very Poor", True)
+check("and sub_index still converts a real concentration",
+      sub_index("PM2.5", 45.0), 75)
 
 # The case the advisory decision exists for: PM2.5 is not the worst pollutant,
 # so keying CPCB's sentence to the PM2.5 band would understate the risk
 # (docs/cpcb_aqi_breakpoints.md, "Resolved 2026-08-10").
-overall, _ = overall_aqi({"PM2.5": 40.0, "PM10": 300.0, "NO2": 30.0})
+overall, _ = overall_aqi({"PM2.5": 60.0, "PM10": 250.0, "NO2": 45.0})
 check("PM10 dominates when it is worse", overall.dominant, "PM10")
 check("and the band is PM10's, not PM2.5's Satisfactory", overall.band, "Poor")
 
@@ -132,16 +147,18 @@ check("and it is refused rather than computed from what is left",
 overall, _ = overall_aqi({"PM2.5": None, "PM10": 140.0, "NO2": 30.0, "SO2": 12.0})
 check("PM10 alone satisfies the either-or rule", overall is not None, True)
 
-# CO's unit in the feed is unknown and mg/m³ is disproved (see aqi.py). It has
-# to be dropped BEFORE the count, or it satisfies a quorum it contributes
-# nothing to.
-check("CO is excluded from the overall AQI", EXCLUDED_FROM_OVERALL, ("CO",))
+# CO is back in, and this is the other half of the same regression. Its unit was
+# never unknown — the feed publishes a sub-index, so a CO of 88 is an AQI of 88.
+# Read as mg/m³ it clamped to 500 and dominated 93.3% of station-hours, which is
+# what EXCLUDED_FROM_OVERALL was invented to suppress.
 overall, reason = overall_aqi({"PM2.5": 72.0, "NO2": 30.0, "CO": 88.0})
-check("an excluded pollutant does not count toward CPCB's 3", overall, None)
-check("and the reason counts 2, not 3", "2 pollutant(s)" in (reason or ""), True)
-overall, _ = overall_aqi({"PM2.5": 72.0, "NO2": 30.0, "SO2": 12.0, "CO": 88.0})
-check("a CO of 88 does not drive the AQI to 500", overall.aqi, 139)
-check("and PM2.5 stays dominant", overall.dominant, "PM2.5")
+check("CO counts toward CPCB's 3 like any other pollutant",
+      overall is not None, True)
+check("a CO of 88 is an AQI of 88, not 500", overall.aqi, 88)
+check("and CO is named as dominant when it is worst", overall.dominant, "CO")
+overall, _ = overall_aqi({"PM2.5": 139.0, "NO2": 30.0, "SO2": 12.0, "CO": 88.0})
+check("but it does not dominate when PM2.5 is worse", overall.dominant, "PM2.5")
+check("and the AQI is PM2.5's", overall.aqi, 139)
 
 overall, reason = overall_aqi({})
 check("no readings at all -> refused", overall, None)

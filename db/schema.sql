@@ -1,4 +1,4 @@
--- AQI Nowcast — Phase 1 and Phase 2 schema.
+-- AQI Nowcast — Phase 1, Phase 2 and Phase 3 schema.
 --
 -- Applied by scripts/init_db.py. Every statement is IF NOT EXISTS, so running
 -- it twice is a no-op and never destroys data. There is no DROP in this file
@@ -225,6 +225,11 @@ CREATE TABLE IF NOT EXISTS sent_log (
     -- What the message actually said, so a complaint about a number is
     -- answerable. NULL observation_ts/pm25_value is the dark-station message.
     --
+    -- pm25_value is µg/m³ from pm25_history, the number the message printed.
+    -- It held observations.value_avg until 2026-08-19, which is a sub-index,
+    -- so rows written before then are AQI values in a column read as µg/m³.
+    -- Do not compare across that date without splitting on it.
+    --
     -- station_id is stored rather than read back through subscribers, because
     -- a subscriber can change station or leave: without it, a feedback tap on
     -- last week's message would attach to this week's station, or to no
@@ -286,3 +291,42 @@ CREATE TABLE IF NOT EXISTS feedback (
 -- observations at the newest bulletin, which the observations PRIMARY KEY
 -- serves.
 
+
+
+-- ---------------------------------------------------------------------------
+-- Phase 3 — the baselines. Written by scripts/backfill_openaq.py, read by
+-- scripts/baselines.py and scripts/compare_sources.py. Nothing else touches it.
+
+
+-- pm25_history — OpenAQ hourly PM2.5, backfilled once.
+--
+-- A separate table from `observations` on purpose, and the two are NOT
+-- interchangeable:
+--
+--   observations   CPCB's national bulletin, arriving hourly, one row per
+--                  station per pollutant. Irreplaceable — every hour not
+--                  logged is gone. Its value_avg is, under the 2026-08-11
+--                  probe_avg_window assumption, ALREADY a CPCB-period average.
+--   pm25_history   OpenAQ's archive of the same CPCB sensors, pulled in bulk
+--                  and rebuildable at any time from the API. Hourly
+--                  measurements.
+--
+-- Merging them would put a rebuildable bulk import into the one table that
+-- cannot be rebuilt, and would give the ingester's idempotency (keyed on the
+-- bulletin timestamp) a second writer that knows nothing about bulletins.
+-- Whether the two carry the same QUANTITY is what scripts/compare_sources.py
+-- measures; until that reaches a verdict, do not join them without reading it.
+CREATE TABLE IF NOT EXISTS pm25_history (
+    station_id      INTEGER     NOT NULL REFERENCES stations(station_id),
+
+    -- Start of the hour the measurement covers, UTC, as OpenAQ reports it.
+    observation_ts  TIMESTAMPTZ NOT NULL,
+
+    -- µg/m³. NOT NULL, unlike observations.value_avg: a missing hour here is an
+    -- absent row, never a null row. The baselines pair hour t with hour t+h and
+    -- score the pair only when both exist, so one representation of "missing"
+    -- means one code path instead of two.
+    value           DOUBLE PRECISION NOT NULL,
+
+    PRIMARY KEY (station_id, observation_ts)
+);

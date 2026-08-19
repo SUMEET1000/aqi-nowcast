@@ -50,15 +50,19 @@ def at(hours_after: float) -> datetime:
     return OBS + timedelta(hours=hours_after)
 
 
-print("The full path — PM2.5 headline, advisory selected by the OVERALL band:")
+print("The full path — µg/m³ headline, advisory selected by the OVERALL band:")
 
-# PM2.5 40 is Satisfactory on its own. PM10 300 puts the overall AQI in Poor.
-# The advisory must be Poor's, or we understate exactly when it matters.
+# Two sources, two quantities. `readings` are CPCB sub-indices from
+# observations.value_avg; pm25_ugm3 is a measured concentration from
+# pm25_history. PM10's sub-index of 250 puts the overall AQI in Poor while the
+# 40 µg/m³ concentration is Satisfactory on its own — the advisory must be
+# Poor's, or we understate exactly when it matters.
 m = compose("Sector-51, Gurugram - HSPCB",
-            {"PM2.5": 40.0, "PM10": 300.0, "NO2": 30.0}, OBS, at(2.0), PROFILE)
+            {"PM2.5": 75.0, "PM10": 250.0, "NO2": 30.0}, OBS, at(2.0), PROFILE,
+            pm25_ugm3=40.0, concentration_ts=OBS)
 check("the headline is PM2.5 in µg/m³", "PM2.5: <b>40 µg/m³</b>" in m.text, True)
 check("and its own band is shown", "— Satisfactory" in m.text, True)
-check("the overall AQI is reported", "Overall AQI 250 (Poor)" in m.text, True)
+check("the CPCB AQI is reported", "CPCB AQI 250 (Poor)" in m.text, True)
 check("the advisory is the OVERALL band's",
       ADVISORY["Poor"] in m.text, True)
 check("not the PM2.5 band's", ADVISORY["Satisfactory"] in m.text, False)
@@ -66,15 +70,25 @@ check("the quote is cited, never presented as ours",
       ADVISORY_CITATION in m.text, True)
 check("the worst pollutant is named", "worst pollutant PM10" in m.text, True)
 check("sent_log gets the numbers", (m.overall_aqi, m.band), (250, "Poor"))
+# The regression that shipped to real people: a sub-index printed as a
+# concentration. 75 is PM2.5's value_avg here and must never reach the headline.
+check("the sub-index is NEVER printed as µg/m³",
+      "75 µg/m³" in m.text, False)
+check("and the two windows are distinguished, not left to collide",
+      "24-hour index" in m.text, True)
 print()
 
 print("The degraded path — CPCB's >=3-pollutant rule fails, so no AQI:")
+# 72 µg/m³ and a PM2.5 sub-index of 138 are the same air: sub_index(72) is 138,
+# and both read Moderate. Inconsistent fixtures here would let the message
+# contradict itself and the test still pass.
 m = compose("Patti Mehar, Ambala - HSPCB",
-            {"PM2.5": 138.0, "NO2": 30.0}, OBS, at(2.0), PROFILE)
+            {"PM2.5": 138.0, "NO2": 30.0}, OBS, at(2.0), PROFILE,
+            pm25_ugm3=72.0, concentration_ts=OBS)
 check("the documented fallback wording fires",
       "the official AQI may be higher" in m.text, True)
-check("it still says what the number is", "PM2.5: <b>138 µg/m³</b>" in m.text, True)
-check("and names the PM2.5 band", "Very Poor for PM2.5" in m.text, True)
+check("it still says what the number is", "PM2.5: <b>72 µg/m³</b>" in m.text, True)
+check("and names the PM2.5 band", "Moderate for PM2.5" in m.text, True)
 check("no AQI is claimed", "Overall AQI" in m.text, False)
 # The whole reason no sentence appears: every one of CPCB's is written against
 # an overall band we do not have here.
@@ -100,6 +114,24 @@ check("and no AQI is sent even though 3 pollutants are present",
 m = compose("Nowhere", {}, None, at(2.0), PROFILE)
 check("a station with no bulletin at all takes the same path",
       "not reporting PM2.5" in m.text, True)
+print()
+
+print("CPCB frozen but OpenAQ live — the 07:00 IST case the two sources exist for:")
+# Measured 2026-08-19: CPCB's last morning bulletin is 05:00 IST and the next is
+# between 10:00 and 13:00, while OpenAQ publishes 06:00 to 09:00 IST. A send at
+# 07:00 therefore has a concentration and no fresh bulletin, and must not fall
+# into the dark-station path — that would tell a subscriber their sensor is
+# broken every single morning.
+m = compose("Patti Mehar, Ambala - HSPCB", {}, None, at(2.0), PROFILE,
+            pm25_ugm3=36.0, concentration_ts=OBS)
+check("it is not treated as a dark station",
+      "not reporting PM2.5" in m.text, False)
+check("the measured concentration is the headline",
+      "PM2.5: <b>36 µg/m³</b>" in m.text, True)
+check("no AQI is invented from a bulletin we do not have",
+      (m.overall_aqi, m.band), (None, None))
+check("and it says why there is no AQI",
+      "no AQI for this station" in m.text, True)
 print()
 
 print(f"Staleness is user-facing from day one (build plan §5, >{STALE_AFTER_H}h):")
