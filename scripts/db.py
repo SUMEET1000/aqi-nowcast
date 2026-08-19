@@ -49,6 +49,21 @@ def redact(text: str) -> str:
     # the moment anyone swaps urllib for requests, whose ConnectionError
     # messages carry the full URL with its query string.
     text = re.sub(r"(api[-_]?key=)[^&\s\"']+", r"\1***", text, flags=re.IGNORECASE)
+    # The Telegram bot token sits in the url path (/bot<id>:<secret>/method),
+    # not in a query string, so neither pattern above reaches it. Live rather
+    # than latent: send_alerts.run() redacts with this function, because a
+    # last-resort handler must not call load_token() and risk failing itself,
+    # and its output goes to a public Actions annotation, the job summary and
+    # fetch_log.error_detail. telegram_api.redact still does the exact-value
+    # strip wherever the token is already in hand — this is the backstop for
+    # everything that escapes to run(). A leaked token reads every subscriber's
+    # messages and sends as us.
+    text = re.sub(r"/bot\d+:[A-Za-z0-9_-]+", "/bot***", text)
+    # The same secret outside a url, from anything that formats the token into
+    # its own message. Latent, but the shape is specific enough to strip on
+    # sight, and a false positive costs a confusing log line while a miss costs
+    # the bot.
+    text = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b", "***", text)
     return text
 
 
