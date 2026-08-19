@@ -135,7 +135,7 @@ async function onCommand(env, sql, chatId, text) {
     await send(
       env,
       chatId,
-      `<b>AQI Nowcast</b>\n\n` +
+      `<b>Vayu Haryana Air Alert</b>\n\n` +
         `One message a day at 7:00 AM IST: the PM2.5 at your station, and CPCB's ` +
         `own health statement for the air quality band it falls in.\n\n` +
         `${DISCLAIMER}\n\n` +
