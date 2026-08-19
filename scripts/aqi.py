@@ -58,6 +58,11 @@ BANDS = [(0, 50, "Good"), (51, 100, "Satisfactory"), (101, 200, "Moderate"),
 # sub_index: the product's headline is the concentration and its band, and
 # deriving one from the other would make a change to the index table silently
 # change the headline.
+#
+# The concentration this is applied to comes from pm25_history (OpenAQ's
+# measured µg/m³), never from observations.value_avg — that column is a
+# sub-index, and feeding it here reads an AQI of 157 as 157 µg/m³ and reports
+# Very Poor for what is really Moderate. That was live until 2026-08-19.
 PM25_BANDS = [(30, "Good"), (60, "Satisfactory"), (90, "Moderate"),
               (120, "Poor"), (250, "Very Poor")]
 PM25_BAND_ABOVE = "Severe"
@@ -105,25 +110,27 @@ ADVISORY_LONG_CITATION = ("CPCB, National Air Quality Index report, Table 3.12, 
 MIN_POLLUTANTS = 3
 REQUIRED_EITHER = ("PM2.5", "PM10")
 
-# CO is left out of the overall AQI because its unit in the data.gov.in feed is
-# unknown, and the breakpoint table above cannot be applied to a number whose
-# unit is unknown. The response carries no unit field for any pollutant.
+# The unit question that used to live here is SETTLED, and there is no longer a
+# pollutant to exclude.
 #
-# Measured 2026-08-13 over 2097 station-hours: read as mg/m³ — what CPCB's table
-# expects — CO is the worst sub-index in 93.3% of them, 38.6% clamp to 500, and
-# the median overall AQI is 382 (Very Poor) against 104 (Moderate) with CO left
-# out. CPCB's own published AQI for Haryana in August is nothing like Very Poor,
-# so mg/m³ is disproved by its consequence. What the unit actually is remains
-# open: the feed's median of 31 would be plausible as 3.1 mg/m³, but a hypothesis
-# that fits is not a measurement, and this number selects the health sentence a
-# subscriber reads.
+# Measured 2026-08-19 by scripts/compare_sources.py against OpenAQ's µg/m³ over
+# four stations and ~180 shared hours each: the data.gov.in feed's avg_value is
+# not a concentration at all, it is CPCB's AQI SUB-INDEX, already computed from
+# a 24-hour mean. Reading it as µg/m³ gives MAE 7.83 / 20.32 / 38.59 / 79.97 on
+# stations 7 / 15 / 10 / 9; reading it as a sub-index gives 0.20 / 1.15 / 2.84 /
+# 15.18. Station 7's 0.20 is the integer-rounding floor, since CPCB publishes
+# whole numbers.
 #
-# Excluding it costs the ≥3-pollutant rule nothing — six pollutants remain — and
-# understates only if CO is genuinely the worst, which PM2.5 and PM10 dominance
-# in NCR makes unlikely. Settle it by comparing our AQI for a Haryana city
-# against the same day's CPCB Daily AQI Bulletin, computed both ways; whichever
-# matches names the unit. Then delete this constant.
-EXCLUDED_FROM_OVERALL = ("CO",)
+# The discriminator was that the ratio between the two sources is not constant —
+# about 1.67 for stations sitting in the lowest band, 2.03 for one in a higher
+# band. A calibration factor cannot produce that; a piecewise breakpoint table
+# can, and does.
+#
+# So CO's median of 31 was never a mystery about units: it is a sub-index of 31,
+# which is an ordinary Satisfactory reading. The old EXCLUDED_FROM_OVERALL =
+# ("CO",) was treating a symptom of double-applying the table, and the 382-vs-104
+# median AQI that justified it was this bug measuring itself. CO now scores like
+# every other pollutant.
 
 
 class Overall(NamedTuple):
@@ -133,7 +140,13 @@ class Overall(NamedTuple):
 
 
 def sub_index(pollutant: str, value: float) -> int:
-    """CPCB's piecewise-linear sub-index. Raises on an unknown pollutant.
+    """CPCB's piecewise-linear sub-index of a CONCENTRATION. Raises on an
+    unknown pollutant.
+
+    Not called by overall_aqi, and must not be: the live feed already publishes
+    sub-indices. This converts a measured concentration into one — so its
+    callers are scripts/compare_sources.py, which used it to prove that fact,
+    and Phase 3/4, which forecast µg/m³ and have to display a band.
 
         I_p = (I_HI - I_LO) / (B_HI - B_LO) * (C_p - B_LO) + I_LO
 
@@ -186,6 +199,14 @@ def overall_aqi(readings: dict[str, float | None]
                 ) -> tuple[Overall | None, str | None]:
     """CPCB's overall AQI from one bulletin's pollutants, or a refusal reason.
 
+    `readings` are observations.value_avg — which are SUB-INDICES, not
+    concentrations (see the note above EXCLUDED_FROM_OVERALL's removal). So the
+    overall AQI is simply the worst of them, and sub_index must NOT be applied
+    here. It was until 2026-08-19, which ran every value through the breakpoint
+    table a second time and overstated the result badly: a true AQI of 157 came
+    out as Very Poor instead of Moderate, and that band selected the health
+    sentence a subscriber read.
+
     Exactly one half of the returned pair is set. A refusal is a normal outcome,
     not an error — CPCB's own rule produces one — so it is returned rather than
     raised, and the caller uses the documented degraded wording. What must never
@@ -194,19 +215,16 @@ def overall_aqi(readings: dict[str, float | None]
     A NULL reading contributes no sub-index. 'NA' becomes NULL at ingest and
     Phase 0 measured 7 per snapshot, so this is the common case, not a guard.
 
-    Pollutants in EXCLUDED_FROM_OVERALL are dropped before the count, so a
-    station reporting PM2.5, CO and NO2 has two pollutants here, not three, and
-    is refused. That is deliberate: an excluded pollutant is one we cannot
-    score, and counting it toward CPCB's quorum would let it satisfy a rule it
-    contributes nothing to.
-
     The returned pair is a tuple rather than an exception or a None-with-flags
     for the same reason cpcb_api.fetch returns (records, http_status): the
     caller has to handle both halves, and the signature says so.
     """
+    # BREAKPOINTS is used here only as the list of pollutants CPCB scores, not
+    # to convert anything. An eighth pollutant would be stored (pollutant_id is
+    # deliberately unconstrained) and would not silently join the quorum until
+    # someone adds it to that table.
     available = {p: v for p, v in readings.items()
-                 if v is not None and p in BREAKPOINTS
-                 and p not in EXCLUDED_FROM_OVERALL}
+                 if v is not None and p in BREAKPOINTS}
 
     if len(available) < MIN_POLLUTANTS:
         return None, (f"only {len(available)} pollutant(s) reporting "
@@ -217,7 +235,7 @@ def overall_aqi(readings: dict[str, float | None]
         return None, (f"neither PM2.5 nor PM10 is reporting "
                       f"({', '.join(sorted(available))}); CPCB requires one of them")
 
-    indices = {p: sub_index(p, v) for p, v in available.items()}
+    indices = {p: int(round(v)) for p, v in available.items()}
     dominant = max(indices, key=lambda p: indices[p])
     aqi = indices[dominant]
     return Overall(aqi, band_of_index(aqi), dominant), None

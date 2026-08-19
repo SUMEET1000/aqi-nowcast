@@ -83,18 +83,36 @@ def feedback_keyboard(sent_log_id: int) -> dict:
 
 def compose(station_name: str, readings: dict[str, float | None],
             observation_ts: datetime | None, now: datetime,
-            profile_label: str) -> Message:
+            profile_label: str,
+            pm25_ugm3: float | None = None,
+            concentration_ts: datetime | None = None) -> Message:
     """The whole message, as a pure function. See tests/test_message.py.
 
     Pure for the same reason ingest.build_rows is: this is the text a real
     person reads about their own health, and it must be checkable without a
     Neon wake or a Telegram send.
 
+    Two numbers, from two sources, and they are NOT the same quantity:
+
+    - `pm25_ugm3` is a real concentration in µg/m³, measured this hour, from
+      pm25_history (OpenAQ). It is the headline, and aqi.pm25_band applies to it.
+    - `readings` are observations.value_avg, which are CPCB's AQI SUB-INDICES of
+      a 24-hour mean, not concentrations. They drive the overall AQI only.
+
+    Mixing them is the bug this signature exists to prevent. Until 2026-08-19
+    the headline printed a sub-index labelled "µg/m³": Ambala read "51 µg/m³"
+    for a true 30, and a station at AQI 157 was reported Very Poor when CPCB
+    calls it Moderate. The message must never call a value_avg a concentration.
+
+    OpenAQ is also the fresher of the two at send time. CPCB's feed freezes each
+    morning — last bulletin 05:00 IST, next between 10:00 and 13:00 — while
+    OpenAQ carries 06:00 to 09:00 IST. Measured 2026-08-19 across four stations.
+
     Three paths, and the difference between them is not cosmetic:
 
-    - PM2.5 is NULL — the station's sensor is dark. Say so. Sending nothing
-      would look like the bot broke, and Phase 1 measured six outages of 10 to
-      19 bulletins each, so this is a regular occurrence rather than an edge.
+    - Neither source has PM2.5 — the station's sensor is dark. Say so. Sending
+      nothing would look like the bot broke, and Phase 1 measured six outages of
+      10 to 19 bulletins each, so this is a regular occurrence rather than an edge.
     - The overall AQI computes — lead with PM2.5, and attach CPCB's advisory
       sentence for the OVERALL band. Keying it to the PM2.5 band would
       understate risk whenever PM2.5 is not the worst pollutant, which is the
@@ -113,7 +131,7 @@ def compose(station_name: str, readings: dict[str, float | None],
     esc = telegram_api.escape
     pm25 = readings.get("PM2.5")
 
-    if observation_ts is None or pm25 is None:
+    if (observation_ts is None or pm25 is None) and pm25_ugm3 is None:
         return Message(
             f"<b>{esc(station_name)}</b>\n\n"
             "This station is not reporting PM2.5 right now, so there is no "
@@ -122,33 +140,50 @@ def compose(station_name: str, readings: dict[str, float | None],
             "Use /stations to switch to another station.",
             None, None)
 
-    age_h = (now - observation_ts).total_seconds() / 3600
     # %I is zero-padded ("05:00 AM"); Windows has no %-I, so strip by hand.
-    reading_time = observation_ts.astimezone(IST).strftime("%I:%M %p").lstrip("0")
+    def ist(ts: datetime) -> str:
+        return ts.astimezone(IST).strftime("%I:%M %p").lstrip("0")
 
-    lines = [
-        f"<b>{esc(station_name)} — {reading_time} IST</b>",
-        "",
-        f"PM2.5: <b>{pm25:.0f} µg/m³</b> — {aqi.pm25_band(pm25)}",
-        "",
-    ]
+    # Staleness is judged on the freshest thing we are showing. At 07:00 IST
+    # that is normally OpenAQ's 07:00 reading rather than CPCB's 05:00 bulletin,
+    # which is what stops the 3h warning firing every single morning.
+    headline_ts = concentration_ts or observation_ts
+    age_h = (now - headline_ts).total_seconds() / 3600
+    reading_time = ist(headline_ts)
+
+    lines = [f"<b>{esc(station_name)} — {reading_time} IST</b>", ""]
+
+    if pm25_ugm3 is not None:
+        lines += [f"PM2.5: <b>{pm25_ugm3:.0f} µg/m³</b> — "
+                  f"{aqi.pm25_band(pm25_ugm3)}", ""]
 
     overall, refusal = aqi.overall_aqi(readings)
     if overall is not None:
         lines += [
-            f"Overall AQI {overall.aqi} ({overall.band}), worst pollutant "
+            f"CPCB AQI {overall.aqi} ({overall.band}), worst pollutant "
             f"{overall.dominant}",
             f"“{aqi.ADVISORY[overall.band]}”",
             f"— {aqi.ADVISORY_CITATION}",
         ]
-    else:
+    elif pm25 is not None:
         # Our own wording, and deliberately so: it describes what our number is
         # and is not, which is not something CPCB has published a sentence for.
         lines += [
-            f"This is PM2.5 only — {aqi.pm25_band(pm25)} for PM2.5. Other "
-            "pollutants are not included, so the official AQI may be higher.",
+            f"This is PM2.5 only — {aqi.band_of_index(int(round(pm25)))} for "
+            "PM2.5. Other pollutants are not included, so the official AQI may "
+            "be higher.",
             f"({refusal})",
         ]
+    else:
+        lines += ["CPCB has published no AQI for this station yet today, so "
+                  "only the measured PM2.5 above is available."]
+
+    # The two numbers cover different windows and would otherwise look like a
+    # contradiction whenever they disagree — which is most of the time, since a
+    # 24-hour index lags an hourly reading by design.
+    if pm25_ugm3 is not None and overall is not None:
+        lines += ["", "PM2.5 is this hour's measurement; the AQI is CPCB's "
+                      "24-hour index."]
 
     lines += ["", f"Reading from {reading_time} IST, {age_h:.1f}h old."]
     if age_h > STALE_AFTER_H:
@@ -187,6 +222,36 @@ def readings_at(conn, bulletin_ts: datetime, station_ids: list[int]
         )
         for station_id, pollutant, value in cur.fetchall():
             out[station_id][pollutant] = value
+    return out
+
+
+def concentrations(conn, station_ids: list[int]
+                   ) -> dict[int, tuple[datetime, float] | None]:
+    """Newest measured PM2.5 in µg/m³ per station, from pm25_history (OpenAQ).
+
+    The real concentration, and at 07:00 IST usually the fresher of our two
+    sources — CPCB's feed is frozen between 05:00 and about 11:00 IST while
+    OpenAQ keeps publishing. Separate from readings_at because the two are
+    different quantities from different feeds on different timestamps, and
+    returning them in one dict is how they got confused in the first place.
+
+    No time floor here. A station whose sensor died a week ago returns its
+    week-old hour, and compose reports the age rather than hiding it — the same
+    rule build plan §5 sets for CPCB's own staleness.
+    """
+    out: dict[int, tuple[datetime, float] | None] = {s: None for s in station_ids}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (station_id) station_id, observation_ts, value
+            FROM pm25_history
+            WHERE station_id = ANY(%s)
+            ORDER BY station_id, observation_ts DESC
+            """,
+            (station_ids,),
+        )
+        for station_id, ts, value in cur.fetchall():
+            out[station_id] = (ts, value)
     return out
 
 
@@ -272,8 +337,9 @@ def main() -> int:
                   else "no active stations to render")
 
         done = set() if args.dry_run else already_sent(conn, send_date)
-        by_station = readings_at(conn, bulletin_ts,
-                                 sorted({r[1] for r in rows}))
+        station_ids = sorted({r[1] for r in rows})
+        by_station = readings_at(conn, bulletin_ts, station_ids)
+        by_conc = concentrations(conn, station_ids)
 
         for chat_id, station_id, station_name, profile_label in rows:
             if chat_id in done:
@@ -283,8 +349,11 @@ def main() -> int:
                 skipped += 1
                 continue
 
+            conc = by_conc.get(station_id)
             message = compose(station_name, by_station[station_id],
-                              bulletin_ts, now, profile_label)
+                              bulletin_ts, now, profile_label,
+                              pm25_ugm3=conc[1] if conc else None,
+                              concentration_ts=conc[0] if conc else None)
 
             if args.dry_run:
                 print(f"\n--- chat {chat_id} | station {station_id} "
@@ -308,8 +377,13 @@ def main() -> int:
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                         """,
+                        # pm25_value is the µg/m³ the message actually printed,
+                        # not observations.value_avg — that column is a
+                        # sub-index, and storing it here made "what number did
+                        # we show this person" unanswerable, which is the one
+                        # job the column has.
                         (chat_id, now, send_date, station_id, bulletin_ts,
-                         by_station[station_id].get("PM2.5"),
+                         conc[1] if conc else None,
                          message.overall_aqi, message.band),
                     )
                     sent_log_id = cur.fetchone()[0]

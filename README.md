@@ -94,7 +94,7 @@ Two things in `.env` are required to run the logger:
 1. **`DATA_GOV_IN_API_KEY`** — data.gov.in → My Account → API Key. Use a personal key; the demo
    key from blog tutorials is rate-limited across everyone who copied it.
 2. **`DATABASE_URL`** — neon.tech → new project → Connect. Change the `sslmode=require`
-   Neon gives you to **`?sslmode=verify-full&sslrootcert=system`**: `require` encrypts but
+   Neon gives you to **`?sslmode=verify-full`** plus an explicit CA bundle: `require` encrypts but
    authenticates nothing, so it does not stop anyone who can answer for the hostname from
    collecting the password and the data.
 
@@ -148,8 +148,10 @@ the script with `--write-doc`.
 
 ## The daily message, and why it goes out at 07:00 IST
 
-One message per subscriber per day: the PM2.5 at their station in µg/m³ and its band, then
-CPCB's own health statement for the **overall** AQI band, quoted and cited. No forecast yet —
+One message per subscriber per day: the measured PM2.5 at their station in µg/m³ and its band,
+CPCB's AQI beside it labelled as the 24-hour index it is, then CPCB's own health statement for
+the **overall** AQI band, quoted and cited. Two numbers from two sources, because they are two
+different quantities over two different windows — saying so is the point. No forecast yet —
 Phase 2 sends current readings only, and a threshold alert on a current reading would just
 restate what is already out of the window.
 
@@ -219,25 +221,37 @@ Stated here rather than discovered by a reader.
   product.
 - Missing hours are common. Forward-filling beyond ~3 hours is fabrication; the cutoff will be
   documented and enforced in code, not left to judgement.
+- **The live feed's `avg_value` is CPCB's AQI sub-index, not a concentration — and this repo
+  assumed it was µg/m³ for ten days, in a message real people received.** Caught on 2026-08-19
+  by `scripts/compare_sources.py`, which checks the feed against OpenAQ's measured µg/m³ for the
+  same CPCB sensors: over four stations and ~180 shared hours each, reading it as µg/m³ gives
+  MAE 7.83–79.97, and reading it as a sub-index gives 0.20–15.18. The 0.20 is the
+  integer-rounding floor. The discriminator was that the ratio between sources is not constant
+  (~1.67 in the lowest band, 2.03 in a higher one) — a calibration factor cannot do that, a
+  piecewise breakpoint table can.
+  Two consequences shipped before it was found: the overall AQI ran every value through the
+  breakpoint table a second time, reporting a true AQI of 157 (Moderate) as Very Poor, and the
+  headline printed a sub-index labelled µg/m³. Both are fixed, and both are covered by named
+  regression cases in `tests/test_aqi.py` and `tests/test_message.py`.
+  **The lesson is the one worth carrying, not the bug.** An independent source had been mapped
+  to all 30 stations since day one, by the Phase 0 gate, and went unused. `probe_avg_window.py`
+  rigorously answered "is this a 24-hour average?" and never asked "is this a concentration at
+  all?" — a correct answer to the wrong question. And when CO came out as the worst pollutant in
+  93.3% of station-hours, that anomaly was suppressed with an exclusion constant and documented,
+  rather than treated as evidence the input was misread. It was. CO's median of 31 is a
+  sub-index of 31, the exclusion is deleted, and CO now scores like everything else.
+  **Rule adopted: any number that reaches a user gets one independent-source check before it
+  ships.** Self-consistency checks do not count — the ones here were self-consistent.
+- The headline **PM2.5 in µg/m³ therefore comes from OpenAQ** (`pm25_history`), with CPCB's AQI
+  reported beside it and labelled as a 24-hour index. OpenAQ is the fresher source at send
+  time: measured 2026-08-19, CPCB's feed is frozen between 05:00 and ~11:00 IST while OpenAQ
+  publishes through 06:00–09:00 IST, which is exactly when the 07:00 alert goes out.
 - A CPCB-comparable AQI needs a 24h window (8h for O₃ and CO) with ≥16h of data across ≥3
-  pollutants, so it cannot come from one reading. Whether the API's `avg_value` is *already*
-  such an average — which would make it computable from a single bulletin — is **measured rather
-  than assumed**: `scripts/probe_avg_window.py` tries to disprove it two ways from the logged
-  history and reports per pollutant. On 2026-08-11, over 26 bulletins and 40 hours, it was **not
-  disproved** for any of the seven pollutants. That is a failure to reject, not a confirmation:
-  the two tests share one `[min, max]` envelope so they are not independent, and the more
-  powerful of them could only have caught a violation in 20% of PM2.5 pairs. **The bot therefore
-  runs on an assumption, recorded with its date and sample size**, not on a settled fact. Either
-  way the headline number stays **PM2.5 in µg/m³ and its band**. See
-  `docs/cpcb_aqi_breakpoints.md`.
-- **CO is left out of the overall AQI, because its unit in the feed is unknown.** CPCB's
-  breakpoints expect mg/m³; the feed reports CO with a median of 31 and no unit field anywhere
-  in the response. Read as mg/m³ that makes CO the worst pollutant in 93.3% of 2,097
-  station-hours and puts the median overall AQI at 382 (Very Poor) against 104 (Moderate)
-  without it — and CPCB's own published Haryana AQI in August is nothing like Very Poor, so
-  mg/m³ is disproved by its consequence. What the unit *is* remains open, so the honest move is
-  to score six pollutants rather than seven and say so. CPCB's ≥3-pollutant rule is still met
-  comfortably.
+  pollutants, so it cannot come from one reading. `scripts/probe_avg_window.py` failed to
+  disprove that `avg_value` is already such an average, over 26 bulletins on 2026-08-11, and
+  the cross-source check above independently supports it: correlation with OpenAQ rises from
+  ~0.3 against raw hourly readings to **0.98** against a trailing 24-hour mean, on all four
+  stations tested. That is now two lines of evidence rather than one, from different sources.
 
 **Infrastructure**
 - **GitHub's `schedule:` trigger is throttled on this repository, and the cron is not the
