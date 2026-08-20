@@ -36,9 +36,16 @@ def exceedance(pairs: list[tuple[float, float]], threshold: float) -> dict:
 
     pairs are (truth, prediction) in ug/m3; both sides are thresholded at the
     same cutoff, so this measures the point forecast rather than a separate
-    classifier. Training a dedicated classifier at a ~2% positive rate would
-    mean class weighting and resampling this project does not need — the
-    regression output already carries the information.
+    classifier.
+
+    This docstring used to add that a dedicated classifier "would mean class
+    weighting and resampling this project does not need — the regression output
+    already carries the information". That was written before anything was
+    measured and it was wrong: every regressor here reached the alert by
+    thresholding a conditional mean, which is what dragged recall to 0.13 while
+    MAE improved. scripts/classify.py predicts the exceedance directly instead.
+    The sentence is kept as a correction rather than deleted, because it is a
+    clean example of an assumption hardening into a fact by being written down.
 
     Returns the confusion counts alongside the rates, because a rate computed
     on four events is not a rate and the counts are the only way to see that.
@@ -52,7 +59,7 @@ def exceedance(pairs: list[tuple[float, float]], threshold: float) -> dict:
 
 
 def best_threshold(pairs: list[tuple[float, float]], event_above: float,
-                   grid: range | None = None) -> tuple[float, float]:
+                   grid=None, default: float | None = None) -> tuple[float, float]:
     """The decision threshold on the PREDICTION that maximises CSI.
 
     The event is still "truth above event_above" — that is fixed by CPCB and is
@@ -70,8 +77,11 @@ def best_threshold(pairs: list[tuple[float, float]], event_above: float,
     """
     if not pairs:
         return event_above, float("nan")
-    grid = grid or range(5, int(event_above) + 1, 5)
-    best, best_csi = float(event_above), 0.0
+    # Any iterable of numbers. scripts/classify.py passes a 0-1 probability
+    # grid, where the concentration default below would mean "never warn".
+    grid = grid if grid is not None else range(5, int(event_above) + 1, 5)
+    best = float(event_above if default is None else default)
+    best_csi = 0.0
     for t in grid:
         csi = exceedance_at(pairs, event_above, float(t))["csi"]
         if csi == csi and csi > best_csi:      # NaN never wins
