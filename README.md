@@ -8,12 +8,15 @@ you what the air is like *right now*; this one tells a specific person whether a
 It is deliberately **not** an AQI dashboard, a map, or a city ranking. The forecast and the
 personalised threshold are the entire product.
 
-**Status: Phase 3 of 5 — the baselines.** Phase 1's gate passed on 2026-08-13: 66 distinct
+**Status: Phase 4 of 5 — the model.** Phase 1's gate passed on 2026-08-13 (66 distinct
 bulletins, 25 of 30 stations carrying a real PM2.5 value on every one, 98.6% run success over
-214 runs. Phase 2's passed on 2026-08-14, the day the bot went live. No model yet, by design:
-the data source is a snapshot with no history, so every hour not logged is training data that
-can never be recovered. Baselines land in Phase 3 and are written into this README *before* any
-model exists, so the goalposts cannot quietly move.
+214 runs), Phase 2's on 2026-08-14 when the bot went live, and Phase 3's on 2026-08-20 with the
+baseline table below — written *before* any model existed, so the goalposts could not quietly
+move.
+
+**Phase 4's benchmark now beats that baseline on average error and loses to it at warning
+anyone, so the forecast is deliberately not switched on.** The numbers, and what it would take
+to fix, are in [The model, and why it is not switched on](#the-model-and-why-it-is-not-switched-on).
 
 ---
 
@@ -234,6 +237,138 @@ Four things about this table are worth stating rather than leaving a reader to f
 
 One station of thirty is absent: **NISE Gwal Pahari, Gurugram** returns HTTP 408 from OpenAQ's
 hourly archive on every attempt. Live ingestion for it is unaffected.
+
+---
+
+## The model, and why it is not switched on
+
+Measured **2026-08-20**. Eight candidates × four horizons × four folds, one seed, identical
+rows. Reproduce with `python scripts/benchmark.py`.
+
+**Two sentences, and both are needed.** The best model cuts 24-hour average error from
+**27.06 to 24.17 µg/m³ — 10.7%, larger than the fold-to-fold spread**, so the gate this project
+set for itself in advance is met. **And no model beats "assume the next hours are like the last
+one" at actually warning anyone about dangerous air**, so the forecast is not in the alert.
+
+### How it is evaluated
+
+Not one held-out window but **four, moving forward in time**. Train on everything up to a date,
+test on the block that follows, extend, repeat. Every fold trains only on the past.
+
+| Fold | Train up to | Test block | Test rows (24h) | Severe |
+|---|---|---|---|---|
+| 1 | 2025-12-31 | 2026-01-01 → 2026-03-01 | 23,461 | 463 |
+| 2 | 2026-03-01 | 2026-03-02 → 2026-04-30 | 31,276 | 527 |
+| 3 | 2026-04-30 | 2026-05-01 → 2026-06-29 | 29,282 | 322 |
+| 4 | 2026-06-29 | 2026-06-30 → 2026-08-20 | 29,255 | 258 |
+
+Phase 3 used a single 90-day window, which was right for measuring a baseline and cannot answer
+the question this phase asks. "Beats persistence by more than split-to-split variance" needs
+more than one split to *have* a variance. It also fixed the sample size that Phase 3's table
+warned about: that window carried ~54 severe pairs, these four carry **1,558**.
+
+### Mean absolute error, µg/m³, by horizon
+
+Mean over folds ± the fold-to-fold standard deviation. n = 113,274 at 24h.
+
+| Candidate | 6h | 12h | 24h | 48h |
+|---|---|---|---|---|
+| persistence | 26.98 ± 4.23 | 31.56 ± 4.16 | 27.06 ± 2.44 | 30.21 ± 2.35 |
+| ridge | 25.44 ± 2.19 | 27.21 ± 1.73 | 26.65 ± 1.60 | 30.09 ± 2.28 |
+| lightgbm | 22.40 ± 2.39 | 24.47 ± 2.22 | 24.77 ± 1.49 | 28.23 ± 1.72 |
+| **lightgbm-tweedie** | **21.69 ± 2.42** | **23.90 ± 2.56** | **24.17 ± 2.40** | **27.54 ± 2.86** |
+| lightgbm-weighted | 30.02 ± 1.89 | 32.20 ± 2.12 | 31.85 ± 3.36 | 35.41 ± 4.50 |
+| lightgbm-q90 | 39.08 ± 3.05 | 43.62 ± 3.90 | 42.83 ± 1.28 | 46.82 ± 5.06 |
+| xgboost | 25.13 ± 2.51 | 28.39 ± 2.63 | 28.99 ± 2.64 | 33.80 ± 2.73 |
+| catboost | 24.35 ± 2.31 | 26.65 ± 2.58 | 26.23 ± 1.68 | 30.40 ± 3.19 |
+
+**Gate 4: PASS.** `27.06 − 24.17 = 2.89`, against a fold-to-fold standard deviation of `2.40`.
+
+**10.7% is below the 15–35% the literature reports**, and that is reported rather than tuned
+toward. The explanation is the next section. The benchmark also prints an automatic leak
+warning above 60% improvement, because a margin that large does not occur in real hourly
+station work; this result is nowhere near it.
+
+**XGBoost at library defaults is worse than persistence at 24h.** Left in the table rather than
+tuned away — the comparison asks which family wins on equal terms, and tuning one candidate
+against untuned baselines would rig it.
+
+### The finding that matters more than the gate
+
+A subscriber does not experience 24.17 µg/m³. They experience a yes or a no: *was I warned when
+it mattered?* So the same predictions are also scored as that decision. Severe hours are 2% of
+the data, so plain accuracy is useless — a model that never warns scores 98%.
+
+At 24h, with each candidate's warning threshold calibrated on validation data:
+
+| Candidate | MAE | severe MAE | recall | CSI |
+|---|---|---|---|---|
+| **persistence** | 27.06 | 245.3 | **0.27** | **0.11** |
+| lightgbm-q90 | 42.83 | **207.1** | **0.27** | 0.10 |
+| xgboost | 28.99 | 266.3 | 0.22 | 0.07 |
+| ridge | 26.65 | 268.9 | 0.21 | 0.09 |
+| lightgbm-weighted | 31.85 | 232.8 | 0.21 | 0.09 |
+| catboost | 26.23 | 272.9 | 0.19 | 0.08 |
+| lightgbm | 24.77 | 270.3 | 0.18 | 0.09 |
+| lightgbm-tweedie | **24.17** | 286.2 | 0.13 | 0.07 |
+
+**Read the first and last columns together — they are close to inverted.** The better a
+candidate's average error, the worse it warns anybody. Before threshold calibration the gap is
+starker still: persistence catches 18% of severe hours and the gate-winning model catches 1%.
+
+This is not a bug. Severe hours are 2% of rows, so a model minimising squared error does best
+by predicting near the middle and never calling a spike. The Tweedie objective was added
+*specifically* because the target is right-skewed and the tail needed handling; it improved the
+average instead and has the worst recall in the table.
+
+Three fixes were tried, each justified by that failure rather than assumed in advance — a
+calibrated warning threshold (the largest single effect: lightgbm recall 0.03 → 0.18),
+severe-row sample weights, and a 90th-percentile quantile objective. **All helped. None
+overtook persistence.** The one real win is `lightgbm-q90`'s severe-band error, **207 against
+persistence's 245** — when a spike is genuinely happening, its number is the closest here.
+
+**So nothing is served.** Wiring a forecast into the daily message would mean shipping a
+product that is better on a number nobody experiences and worse at the only job it has.
+
+### What it needs
+
+The model is being asked to predict spikes from PM2.5 history alone. Spikes happen when the
+wind drops and the boundary layer collapses, and **none of that is in the training data yet.**
+Weather features are the next stage, and they are now a measured requirement rather than a
+planned nice-to-have.
+
+### Method notes
+
+- **Every feature is counted from the moment the forecast is issued**, never from the target
+  hour. For a 24-hour forecast of 4pm today, that moment is 4pm yesterday. Counting a lag back
+  from the target instead is a leak that makes the score look excellent and the model useless;
+  a test asserts the property directly, on a fixture where each value equals its own timestamp,
+  and it was written before the model existed.
+- **A second test asserts no fold trains on a label from its own test block.** That is a
+  different leak: a row's features can be impeccably backward-looking while its *label* sits
+  inside the test window.
+- **Gaps are never filled.** 97% of missing hours sit in runs longer than 3 hours, past the
+  point where a forward-fill is an estimate rather than fabrication.
+- **4,379 readings of exactly 0.0 µg/m³ (2.27%) are masked as missing.** 58% of those hours sit
+  in runs longer than a day and 81% of runs begin in the hour after a reading above 20 µg/m³ —
+  a sensor dropping out, not clean air. The existing range check could not see them, because
+  0.0 is inside the valid range.
+- **Preprocessing choices were measured, not assumed**, and every one landed inside the
+  fold-to-fold noise. Scaler, imputer and station encoding all moved MAE by less than the
+  spread between folds. Where that happened, the simpler option was taken.
+- **Neighbouring-station features were built and then dropped.** Cross-station correlation is
+  0.23 within 30 km and 0.24 beyond 150 km — no distance decay to exploit across ~300 km and
+  several airsheds — and the ablation found removing them nominally better.
+- **No shuffled splits, no purging or embargo** (the label is a point value and every feature
+  is strictly backward, so the conditions requiring it do not hold), and **no significance
+  test** — at four folds the standard one's assumptions do not hold, so the fold-to-fold spread
+  is the test.
+- One station of thirty, **NISE Gwal Pahari, Gurugram**, has no usable history: OpenAQ's archive
+  returns HTTP 408 on every attempt. Live ingestion for it is unaffected.
+
+Exploratory analysis, with the plots and the cleaning evidence, is in
+[`notebooks/01_eda_cleaning.ipynb`](notebooks/01_eda_cleaning.ipynb) and its generated summary
+[`docs/eda.md`](docs/eda.md).
 
 ---
 

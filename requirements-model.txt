@@ -1,0 +1,38 @@
+# Phase 4 model dependencies. OFFLINE ONLY — deliberately not requirements.txt.
+#
+# Both workflows run `pip install -r requirements.txt` every ~30 minutes. Nothing
+# in Actions imports anything below, and adding ~300 MB of ML wheels to that file
+# would slow every ingest run for code no workflow executes. requirements.txt
+# stays at one runtime dependency, which is a claim the README makes.
+#
+# Install with:  pip install -r requirements-model.txt
+#
+# Pinned exactly, same discipline as psycopg. A benchmark whose libraries move
+# under it is not reproducible, and the model card records these versions as the
+# environment a result was produced in.
+
+numpy==2.4.4
+pandas==3.0.2
+
+# scikit-learn supplies Ridge, the per-fold Pipeline, and the scalers and
+# imputers the ablation table compares. The Pipeline is the load-bearing part:
+# it fits the imputer and scaler on the training fold only, which is the leak
+# that hand-rolled preprocessing introduces silently.
+scikit-learn==1.8.0
+
+# The three boosting libraries. All handle NaN natively, which is why the gap
+# policy can be "never fill" — a sequence model would need the gaps imputed.
+lightgbm==4.6.0
+xgboost==3.1.3
+catboost==1.2.8
+
+# statsmodels is here for exactly one thing: the partial autocorrelation function
+# in the EDA notebook, which is what justifies the lag set instead of picking
+# 1/2/3/6/12/24/48 because they look reasonable. Plain ACF is a few lines of
+# numpy; PACF needs Levinson-Durbin and is not worth hand-rolling for a plot.
+statsmodels==0.14.6
+
+# Notebook stack. matplotlib for the EDA plots; jupyter to run the notebook at
+# all. Neither is imported by any script.
+matplotlib==3.10.6
+jupyter==1.1.1
