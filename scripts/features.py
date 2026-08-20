@@ -210,7 +210,7 @@ def _cyclical(values: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
 def _station_block(wide: pd.DataFrame, station: int, horizon: int,
                    nbrs: dict[int, list[int]] | None,
                    spatial: bool, cyclical: bool,
-                   min_present: float, weather: bool = True,
+                   min_present: float, weather: bool = False,
                    blh: str = "none",
                    weather_frame: pd.DataFrame | None = None) -> pd.DataFrame:
     """One station's rows, indexed by ISSUE hour.
@@ -280,7 +280,7 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
 def build(wide: pd.DataFrame, horizon: int,
           coords: dict[int, tuple[float, float]] | None = None,
           spatial: bool = True, cyclical: bool = True,
-          min_present: float = MIN_PRESENT, weather: bool = True,
+          min_present: float = MIN_PRESENT, weather: bool = False,
           blh: str = "none",
           cells: dict[int, tuple[float, float]] | None = None,
           weather_frames: dict[tuple[float, float], pd.DataFrame] | None = None
@@ -355,6 +355,12 @@ def main() -> int:
                     help="cache station coordinates from Neon (one wake)")
     ap.add_argument("--describe", action="store_true",
                     help="print the column list and per-horizon row counts")
+    # Off by default here for the same reason it is off in benchmark.py: the
+    # 2026-08-20 ablation put every weather variant inside the fold noise.
+    ap.add_argument("--weather", action="store_true",
+                    help="include the archived-forecast columns at 24h and 48h")
+    ap.add_argument("--blh", choices=["none", "issue", "target"], default="none",
+                    help="boundary-layer-height variant, with --weather")
     args = ap.parse_args()
 
     if args.pull_stations:
@@ -373,7 +379,8 @@ def main() -> int:
           f"({wide.notna().mean().mean():.1%} of slots present)\n")
 
     for h in HORIZONS:
-        frame = build(wide, h, coords, spatial=coords is not None)
+        frame = build(wide, h, coords, spatial=coords is not None,
+                      weather=args.weather, blh=args.blh)
         X, y = split_xy(frame)
         wx_count = sum(column.startswith("wx_") for column in X.columns)
         print(f"horizon {h:>2}h: {len(X.columns)} feature columns "

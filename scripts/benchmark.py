@@ -421,7 +421,7 @@ def _inner_score(frame, candidate, **kw) -> dict[str, float]:
             "csi_std": float(result["inner CSI"].std(ddof=1))}
 
 
-def ablate(wide: pd.DataFrame, coords, weather: bool = True,
+def ablate(wide: pd.DataFrame, coords, weather: bool = False,
            blh: str = "none") -> str:
     """The table that turns preprocessing folklore into measurements."""
     out = ["## Ablations — decided on inner validation, never on test",
@@ -668,10 +668,20 @@ def main() -> int:
                     help="preprocessing ablations on the inner validation window")
     ap.add_argument("--only", action="append", choices=list(CANDIDATES),
                     help="run just these candidates (repeatable)")
-    ap.add_argument("--no-weather", action="store_true",
-                    help="omit weather columns from every feature frame")
+    # Weather is OFF by default, on the ablation of 2026-08-20 (--ablate).
+    # At 24h on inner validation, lightgbm-q90 scored CSI 0.135 with NO weather,
+    # 0.133 with the forecast columns and 0.130 adding the lid at issue time — a
+    # spread of 0.008 against a CSI fold std of 0.087, ten times inside the noise.
+    # The leaky ceiling variant, handed the true lid at the target hour, reached
+    # only 0.138, so even a perfect boundary-layer forecast buys about 0.003.
+    # Kept behind a flag rather than deleted: it is the first thing to re-measure
+    # if a finer-grained weather product ever becomes available.
+    ap.add_argument("--weather", action="store_true",
+                    help="add the archived-forecast weather columns at 24h/48h "
+                         "(the ablation does not support them — see the note above)")
     ap.add_argument("--blh", choices=["none", "issue", "target"], default="none",
-                    help="boundary-layer-height feature variant")
+                    help="boundary-layer-height variant; 'target' reads the "
+                         "answer key and exists only to price a ceiling")
     # Spatial features are OFF by default, on two independent measurements:
     #   1. EDA 2026-08-20 — median cross-station correlation is 0.23 within
     #      30 km and 0.24 beyond 150 km, and corr(distance, correlation) is
@@ -686,9 +696,9 @@ def main() -> int:
                          "support them — see the note above this flag)")
     args = ap.parse_args()
 
-    if args.no_weather and args.blh != "none":
-        sys.exit(f"--no-weather removes the weather columns, so --blh {args.blh} "
-                 "would have nothing to attach to. Pick one.")
+    if args.blh != "none" and not args.weather:
+        sys.exit(f"--blh {args.blh} attaches a boundary-layer column to the "
+                 "weather block, which --weather turns on. Pass both or neither.")
 
     if args.refresh:
         from baselines import pull
@@ -713,11 +723,11 @@ def main() -> int:
         # Before the other frames are built: ablations only ever touch the 24h
         # horizon, and building the other three would be a minute of nothing.
         print(f"ablations, seed {RANDOM_SEED}:", flush=True)
-        print("\n" + ablate(wide, coords, weather=not args.no_weather, blh=args.blh))
+        print("\n" + ablate(wide, coords, weather=args.weather, blh=args.blh))
         return 0
 
     frames = {h: features.build(wide, h, coords, spatial=coords is not None,
-                                weather=not args.no_weather, blh=args.blh)
+                                weather=args.weather, blh=args.blh)
               for h in HORIZONS}
 
     if args.folds:
