@@ -444,6 +444,29 @@ try:
 except ValueError as exc:
     check("missing cell raises ValueError naming the station", "4" in str(exc), True)
 
+print("\n-- the window label spans hours, and admits the same rows --")
+# "Is this evening safe" is a question about a stretch, not a clock hour. On the
+# ramp the value IS the hour, so the max over W hours starting at the target is
+# the LAST hour of that window - which makes the span readable as arithmetic.
+for h in (6, 24):
+    point = build(WIDE, h, COORDS)
+    for w in (1, 3, 4):
+        frame = build(WIDE, h, COORDS, target_window=w)
+        row = pick(frame)
+        check(f"h={h} w={w}: target is the max over the window, i.e. issue+h+w-1",
+              float(row["_target"]) - OFFSET[SAFE_STATION] - SAFE_ISSUE,
+              float(h + w - 1))
+        # Admission must not drift, or the windowed table is scored on a
+        # different set of hours than the point table and the two cannot be
+        # compared. The label changes; the rows do not.
+        check(f"h={h} w={w}: admits exactly the same rows as the point label",
+              len(frame), len(point))
+    # A window of 1 must be the point label, byte for byte, or every number
+    # already published silently changes meaning.
+    check(f"h={h}: w=1 is identical to no window at all",
+          build(WIDE, h, COORDS, target_window=1)["_target"].equals(point["_target"]),
+          True)
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {failures}")
