@@ -344,15 +344,19 @@ def render_doc(mapped: list, unmatched: list, total: int) -> str:
         "will be served against.",
         "",
         "**Open-Meteo is the weather-feature source for Phase 4, and the history fallback.** "
-        "It is CAMS *model reanalysis* on an ~11km grid, not measurements. Two consequences:",
+        "It is *model output*, not measurements. Three consequences:",
         "",
         "1. There are no station ids — you map by lat/lon, so the §0.2 mismatch trap does not "
         "apply to it.",
-        "2. **Source bias:** training on modelled data while serving against measured CPCB "
-        "data is a real and different problem. The Gurugram stations sit close enough that "
-        "several land in one CAMS cell — identical 'history' for stations that genuinely read "
-        "differently. If we ever fall back to Open-Meteo for PM2.5 history, this goes in the "
-        "README under §10, not hidden.",
+        "2. **The weather grid is 0.0703° × 0.1023° (~7.8 km × ~10.0 km), measured "
+        "2026-08-20 by `scripts/probe_weather_grid.py`, not taken from the docs.** Six of the "
+        "thirty stations share a cell with another station and receive bit-identical weather: "
+        "12/23/28 in Gurugram, and 13/14/18 in Faridabad. The archive and forecast endpoints "
+        "agree on the cell assignment, so the training grid is the serving grid.",
+        "3. **Source bias:** training on modelled data while serving against measured CPCB "
+        "data is a real and different problem. If we ever fall back to Open-Meteo for PM2.5 "
+        "history, that goes in the README under §10, not hidden. The **air-quality** endpoint "
+        "(CAMS PM2.5) is a different product on a different grid and has not been probed.",
         "",
         "Open-Meteo hourly PM2.5 was verified available for 2024-11-01→07 at Gurugram coords "
         "(168/168 non-null, 26.6–224.9 µg/m³), i.e. full stubble-burning season coverage with "
