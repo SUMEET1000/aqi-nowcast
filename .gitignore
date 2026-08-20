@@ -72,6 +72,12 @@ PHASE2_PLAN.md
 # private ones. The whole directory, because there is one file per session.
 Handoff/
 
+# Local cache of pm25_history for scripts/baselines.py. Generated, ~10 MB, and
+# rebuildable at any time with --refresh; the database is the source of truth.
+# It exists because Neon bills per wake, so iterating on the baseline arithmetic
+# against the database would be dozens of wakes for an answer that never changes.
+data/
+
 # OS / editor
 .DS_Store
 Thumbs.db

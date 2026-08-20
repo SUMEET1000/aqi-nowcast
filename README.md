@@ -185,6 +185,58 @@ precisely because asking friends produces politeness, and a 👍 six weeks from 
 
 ---
 
+## What a forecast has to beat
+
+Measured **2026-08-20**, before any model exists, so the bar cannot move afterwards.
+
+Three baselines over 29 Haryana stations, on **192,597 hourly OpenAQ readings** spanning
+2025-02-18 to 2026-08-20. The held-out window is the **last 90 days**; climatology is fitted on
+the training half only. Reproduce with `python scripts/baselines.py`.
+
+| Baseline | Horizon | MAE | RMSE | n | MAE severe | RMSE severe | n severe |
+|---|---|---|---|---|---|---|---|
+| persistence | 6h | 23.57 | 51.57 | 6399 | 274.54 | 330.92 | 51 |
+| persistence | 12h | 27.46 | 54.58 | 6354 | 275.15 | 324.50 | 50 |
+| persistence | 24h | 27.91 | 57.85 | 6830 | 269.75 | 327.73 | 54 |
+| persistence | 48h | 31.19 | 60.06 | 6694 | 283.87 | 334.74 | 55 |
+| seasonal persistence | 6h | 28.08 | 58.17 | 6399 | 274.47 | 333.40 | 51 |
+| seasonal persistence | 12h | 27.95 | 57.95 | 6354 | 260.36 | 317.40 | 50 |
+| seasonal persistence | 24h | 27.91 | 57.85 | 6830 | 269.75 | 327.73 | 54 |
+| seasonal persistence | 48h | 31.19 | 60.06 | 6694 | 283.87 | 334.74 | 55 |
+| climatology | 6h | 33.01 | 52.15 | 6399 | 303.19 | 340.39 | 51 |
+| climatology | 12h | 32.86 | 51.54 | 6354 | 294.47 | 329.54 | 50 |
+| climatology | 24h | 32.63 | 51.51 | 6830 | 298.84 | 335.10 | 54 |
+| climatology | 48h | 33.18 | 52.29 | 6694 | 302.66 | 338.07 | 55 |
+
+MAE and RMSE in µg/m³. Severe = above 250 µg/m³, CPCB's top PM2.5 band.
+
+**Persistence at 24h, MAE 27.91, is the number to beat.** Per horizon and with RMSE beside MAE,
+because error grows with horizon and a single averaged figure hides that.
+
+Four things about this table are worth stating rather than leaving a reader to find:
+
+- **All three baselines are scored on the same hours.** A target hour counts only when every
+  baseline can predict it. Letting each one use everything it happened to reach gave persistence
+  49,993 pairs against climatology's 7,534 — climatology has nothing to say for a station whose
+  training half contains no June, and most of these stations begin in September 2025. Two MAEs
+  drawn from two different sets of hours invite exactly the comparison this table exists to
+  support.
+- **Gaps are never filled.** A missing hour removes the pair. Beyond about three hours a
+  forward-fill is fabrication, and these sensors go dark in blocks of 10–19 hours.
+- **The severe-band columns rest on ~50 pairs.** They are reported because a model that is
+  accurate on ordinary air and blind to the spikes is useless for this product, but 50 pairs is
+  not enough to separate two models. The August held-out window is the monsoon; the number that
+  will count is the same table re-run after November.
+- **Seasonal persistence reads the same hour a whole number of days back**, rounded up to the
+  horizon — 24h at 6/12/24h, 48h at 48h. A flat 24h lag at the 48h horizon would read a value
+  from after the forecast was issued, which is a leak. At the 24h and 48h horizons it is
+  therefore identical to persistence by construction.
+
+One station of thirty is absent: **NISE Gwal Pahari, Gurugram** returns HTTP 408 from OpenAQ's
+hourly archive on every attempt. Live ingestion for it is unaffected.
+
+---
+
 ## What Phase 0 found that changed the design
 
 These cost a day to discover and are the reason the probe scripts are kept rather than deleted.
