@@ -330,12 +330,52 @@ persistence's 245** — when a spike is genuinely happening, its number is the c
 **So nothing is served.** Wiring a forecast into the daily message would mean shipping a
 product that is better on a number nobody experiences and worse at the only job it has.
 
+### Weather was the obvious fix. It did not work, and that is the finding.
+
+Spikes happen when the wind drops and the boundary layer collapses, so the natural conclusion
+from the table above was that the model is blind without weather. That was tested rather than
+assumed, and it is wrong here.
+
+Training used **archived forecasts**, not weather that actually happened. A 24-hour forecast is
+issued a day early, when nobody knows the wind yet — only what the forecast said it would be.
+Open-Meteo's Previous Runs archive serves exactly that, at a fixed lead, and the gap is real:
+a day-ahead wind forecast carries **MAE 2.607 m/s** against what the wind actually did, which is
+~69% of the difference between the two most distant stations in the network, 312 km apart.
+Training on the actuals would have absorbed all of that silently and produced a better score
+with no way to earn it in production.
+
+Measured 2026-08-20, `benchmark.py --ablate`, `lightgbm-q90` at 24h over four folds on inner
+validation, ranked on CSI because MAE and recall run opposite here:
+
+| weather variant | inner CSI | recall | columns |
+|---|---|---|---|
+| **no weather** | **0.135** | **0.337** | 21 |
+| forecast only | 0.133 | 0.333 | 27 |
+| forecast + boundary layer at issue time | 0.130 | 0.326 | 29 |
+| forecast + boundary layer at target time *(leaky, ceiling only)* | 0.138 | 0.324 | 28 |
+
+Spread **0.008** against a CSI fold-to-fold std of **0.087** — ten times inside the noise. No
+weather is second, and recall falls as weather is added. Weather is therefore behind a
+`--weather` flag rather than in the model, and the default reproduces the table above exactly.
+
+**The last row is the one worth reading.** It is given the *true* boundary layer height at the
+hour being predicted — an answer key no production system can have — and it still reaches only
+0.138 against 0.135. A perfect boundary-layer forecast would buy about 0.003 CSI. That result
+exists to stop a plausible next step: chasing a better weather product is not worth the week it
+would cost.
+
+**Three independent measurements now say the same thing.** Cross-station PM2.5 correlation is
+0.23 within 30 km against 0.24 beyond 150 km. Two stations sharing an ~8 km weather cell
+disagree by 50.9 µg/m³ hour to hour, against 47.8 µg/m³ for all 406 pairs up to 312 km apart.
+And weather at that grid cannot move the alert. Station-level PM2.5 in this network is driven by
+local conditions — traffic, construction, the sensor itself — not by anything a regional weather
+model resolves.
+
 ### What it needs
 
-The model is being asked to predict spikes from PM2.5 history alone. Spikes happen when the
-wind drops and the boundary layer collapses, and **none of that is in the training data yet.**
-Weather features are the next stage, and they are now a measured requirement rather than a
-planned nice-to-have.
+Not weather, on this evidence. The remaining levers are a finer-grained exposure signal than
+any free product currently offers, or accepting that persistence is the honest baseline for the
+alert and shipping it as such.
 
 ### Method notes
 
@@ -400,6 +440,20 @@ These cost a day to discover and are the reason the probe scripts are kept rathe
 ## Known limitations
 
 Stated here rather than discovered by a reader.
+
+**Weather**
+- **Six of thirty stations share an Open-Meteo grid cell** and receive bit-identical weather:
+  three in Gurugram, three in Faridabad. The grid was measured at 0.0703° × 0.1023°
+  (~7.8 × ~10.0 km), not taken from the documentation, which quotes coarser figures.
+- **A day-ahead wind forecast carries 2.607 m/s of error**, ~69% of the spread between the two
+  most distant stations in the network. Any weather-driven forecast inherits that.
+- **The boundary layer height is not available at lead time.** The archive of past forecasts
+  serves it as a column that exists and is entirely empty, so half the spike mechanism cannot be
+  trained on honestly. It was priced instead, by fitting a variant on the true value — see
+  above.
+- **The 6h and 12h horizons carry no weather at all.** The lead-time archive is indexed in whole
+  days, so there is no forecast at a 6-hour lead; feeding them a day-old one would be a 24-hour
+  forecast wearing a 6-hour label.
 
 **Data**
 - The live API is a snapshot. We are time-constrained by our own logging.
