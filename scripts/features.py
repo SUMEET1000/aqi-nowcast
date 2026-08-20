@@ -60,6 +60,40 @@ TARGET_WINDOW = 1
 # different situation from 120 on the way down, and no single lag says which.
 TREND_SPANS = (3, 6)
 
+# Tail features, off by default. They are aimed at the spike, which is where
+# every failure so far has been, and they are gated so that the stage 1 and
+# stage 3 tables stay reproducible to the decimal without them.
+#
+# Extra own-history lags: the longest ordinary lag is 48h, so nothing sees
+# "the same hour last week".
+TAIL_LAGS = (72, 168)
+
+# A reading above this counts as an exceedance for the recency features. It is
+# CPCB's Very Poor band, the same number classify.py defaults to, because a
+# station that crossed the line twice yesterday is in a different regime.
+EXCEED_ABOVE = 121.0
+EXCEED_COUNT_WINDOWS = (24, 72)
+
+# Cap on hours-since-last-exceedance. Uncapped, a clean station reads as an
+# arbitrarily large number that swamps the split points; a week is long enough
+# to mean "not recently".
+SINCE_CAP = 168
+
+# Window for the per-station z-score. Station means differ a lot and the model
+# otherwise has to learn each one from station_id alone. A week is long enough
+# to carry a level and short enough to follow a seasonal shift.
+Z_WINDOW = 168
+
+# Diwali (Lakshmi Puja night) in IST. This is NCR: the largest predictable spike
+# of the year is a DATE, and it was not in the features until now.
+#
+# Only 2025-10-20 falls inside the history, so the model sees ONE instance and
+# no fold can validate it. It is here because the cost is a column and the
+# alternative is a model that provably cannot see the biggest event in the year,
+# but do not read a gain on this column as evidence at n=1.
+DIWALI = ("2024-11-01", "2025-10-20", "2026-11-08")
+DIWALI_WINDOW = 10   # days either side; beyond this the column saturates
+
 # Neighbouring stations to average. Pollution arrives from somewhere, and
 # neighbouring stations correlate — this is the flat-feature stand-in for the
 # graph model the no-deep-learning rule excludes.
@@ -212,10 +246,68 @@ def _cyclical(values: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
     return np.sin(radians), np.cos(radians)
 
 
+def _tail_block(own: pd.Series, index: pd.Index) -> dict[str, pd.Series | np.ndarray]:
+    """Spike-shaped features. Every one is a backward window on this station.
+
+    `own` is already reindexed onto the complete hourly grid, so every shift and
+    every rolling window below is an exact number of HOURS, including across an
+    outage. Nothing here reads past its own row.
+    """
+    out: dict[str, object] = {}
+    for lag in TAIL_LAGS:
+        out[f"lag_{lag}"] = own.shift(lag)
+
+    for w in ROLL_WINDOWS:
+        # For a spike the recent MAXIMUM is the obvious signal and only the mean
+        # and std existed. min comes free from the same window and says whether
+        # the air ever cleared.
+        roll = own.rolling(w, min_periods=max(1, int(math.ceil(w * MIN_PRESENT))))
+        out[f"roll_max_{w}"] = roll.max()
+        out[f"roll_min_{w}"] = roll.min()
+
+    # A missing hour counts as "no exceedance" rather than as unknown. The
+    # alternative propagates NaN across every gap and empties the column on the
+    # stations that go dark for 10-19h at a time, which is most of them.
+    over = (own > EXCEED_ABOVE).astype(float)
+    for w in EXCEED_COUNT_WINDOWS:
+        out[f"exceed_count_{w}"] = over.rolling(w, min_periods=1).sum()
+
+    # Hours since the last exceedance, INCLUDING the current hour (0 when the
+    # air is over the line right now). ffill of "the hour this last happened" is
+    # backward-looking by construction; before the first exceedance it is NaN,
+    # which is the truth rather than a made-up large number.
+    hours = pd.Series(np.asarray(index, dtype=float), index=index)
+    last = hours.where(over > 0).ffill()
+    out["hours_since_exceed"] = (hours - last).clip(upper=SINCE_CAP)
+
+    # Per-station normalisation: how unusual is right now FOR THIS STATION.
+    win = own.rolling(Z_WINDOW, min_periods=int(Z_WINDOW * MIN_PRESENT))
+    mean, std = win.mean(), win.std()
+    out[f"z_{Z_WINDOW}"] = (own - mean) / std.where(std > 0)
+    return out
+
+
+def _diwali_days(index: pd.Index) -> np.ndarray:
+    """Signed days from the nearest Diwali, clipped to +/- DIWALI_WINDOW.
+
+    A calendar column, so it carries no information about the future beyond what
+    a wall calendar already carries. Negative is before, positive is after -
+    signed rather than absolute because the smoke lingers for days afterwards
+    and the run-up is not symmetric with it.
+    """
+    days = (pd.to_datetime(np.asarray(index) * 3600, unit="s", utc=True)
+            .tz_convert(IST).normalize().tz_localize(None))
+    offsets = np.stack([(days - pd.Timestamp(d)).days.to_numpy(dtype=float)
+                        for d in DIWALI])
+    nearest = offsets[np.abs(offsets).argmin(axis=0), np.arange(len(days))]
+    return np.clip(nearest, -DIWALI_WINDOW, DIWALI_WINDOW)
+
+
 def _station_block(wide: pd.DataFrame, station: int, horizon: int,
                    nbrs: dict[int, list[int]] | None,
                    spatial: bool, cyclical: bool,
-                   min_present: float, weather: bool = False,
+                   min_present: float, tail: bool = False,
+                   weather: bool = False,
                    blh: str = "none",
                    weather_frame: pd.DataFrame | None = None,
                    target_window: int = 1) -> pd.DataFrame:
@@ -243,6 +335,11 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
 
     for span in TREND_SPANS:
         block[f"trend_{span}"] = own - own.shift(span)
+
+    if tail:
+        for name, values in _tail_block(own, wide.index).items():
+            block[name] = values
+        block["diwali_days"] = _diwali_days(wide.index)
 
     if spatial and nbrs is not None:
         near = wide[nbrs[station]].mean(axis=1)
@@ -300,7 +397,8 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
 def build(wide: pd.DataFrame, horizon: int,
           coords: dict[int, tuple[float, float]] | None = None,
           spatial: bool = True, cyclical: bool = True,
-          min_present: float = MIN_PRESENT, weather: bool = False,
+          min_present: float = MIN_PRESENT, tail: bool = False,
+          weather: bool = False,
           blh: str = "none", target_window: int = TARGET_WINDOW,
           cells: dict[int, tuple[float, float]] | None = None,
           weather_frames: dict[tuple[float, float], pd.DataFrame] | None = None
@@ -355,7 +453,7 @@ def build(wide: pd.DataFrame, horizon: int,
                              "re-run scripts/weather.py --pull")
 
     blocks = [_station_block(
-        wide, s, horizon, nbrs, spatial, cyclical, min_present, weather, blh,
+        wide, s, horizon, nbrs, spatial, cyclical, min_present, tail, weather, blh,
         weather_frames[cells[s]] if weather_frames is not None else None,
         target_window)
               for s in wide.columns]
@@ -382,6 +480,12 @@ def main() -> int:
                     help="include the archived-forecast columns at 24h and 48h")
     ap.add_argument("--blh", choices=["none", "issue", "target"], default="none",
                     help="boundary-layer-height variant, with --weather")
+    # Off by default so the stage 1 and stage 3 tables stay reproducible; the
+    # ablation is what decides whether they earn a place, exactly as --spatial
+    # and --weather were decided.
+    ap.add_argument("--tail", action="store_true",
+                    help="include the spike-shaped columns (long lags, rolling "
+                         "max/min, exceedance recency, z-score, Diwali)")
     args = ap.parse_args()
 
     if args.pull_stations:
@@ -401,7 +505,7 @@ def main() -> int:
 
     for h in HORIZONS:
         frame = build(wide, h, coords, spatial=coords is not None,
-                      weather=args.weather, blh=args.blh)
+                      tail=args.tail, weather=args.weather, blh=args.blh)
         X, y = split_xy(frame)
         wx_count = sum(column.startswith("wx_") for column in X.columns)
         print(f"horizon {h:>2}h: {len(X.columns)} feature columns "

@@ -153,16 +153,54 @@ def fit_lgbm_balanced(Xtr, ytr, Xte, **kw):
     return _lgbm(Xtr, ytr, Xte, balanced=True, **kw)
 
 
-def fit_xgboost(Xtr, ytr, Xte, **_):
+def fit_xgboost(Xtr, ytr, Xte, **kw):
     import xgboost as xgb
 
     tr, te = _prep(Xtr, "ordinal"), _prep(Xte, "ordinal")
     pos = float((ytr == 1).sum())
     model = xgb.XGBClassifier(
         random_state=RANDOM_SEED, n_jobs=-1, tree_method="hist",
-        scale_pos_weight=float((ytr == 0).sum()) / pos if pos else 1.0)
+        scale_pos_weight=float((ytr == 0).sum()) / pos if pos else 1.0, **kw)
     model.fit(tr, ytr)
     return model.predict_proba(te)[:, 1]
+
+
+# Random-search space, applied only to the tree candidates. Persistence has no
+# knobs at all, which is exactly why tuning here does not rig the table the way
+# stage 1's rule forbade: there is no setting of these that could have made the
+# baseline look worse. logistic is deliberately left untuned - it is the "is a
+# tree justified at all" sanity check, and a tuned sanity check no longer
+# answers that question.
+#
+# Ranges are the ordinary LightGBM/XGBoost ones, wide enough to include the
+# library default so the search can decline to move.
+TUNE_SPACE = {
+    "num_leaves": [15, 31, 63, 127, 255],
+    "learning_rate": [0.02, 0.05, 0.1, 0.2],
+    "min_child_samples": [5, 20, 50, 100, 200],
+    "n_estimators": [100, 200, 400, 800],
+    "subsample": [0.6, 0.8, 1.0],
+    "colsample_bytree": [0.6, 0.8, 1.0],
+}
+TUNABLE = ("lightgbm", "lightgbm-balanced", "xgboost")
+TUNE_DRAWS = 8
+
+
+def draw_params(rng, name: str) -> dict:
+    params = {k: rng.choice(v).item() for k, v in TUNE_SPACE.items()}
+    if name == "xgboost":
+        # XGBoost grows by depth, not by leaf count, and subsample below 1
+        # needs the hist sampler it already uses. num_leaves is not its word.
+        params["max_depth"] = int(np.log2(params.pop("num_leaves")))
+        # XGBoost has no min_child_samples; the same idea is min_child_weight,
+        # and passing the LightGBM name lands in **kwargs and is SILENTLY
+        # IGNORED - a search that thinks it is varying a parameter it is not.
+        params["min_child_weight"] = params.pop("min_child_samples")
+    else:
+        # LightGBM ignores subsample unless bagging_freq is set, so an untouched
+        # subsample would silently be a no-op parameter in the search.
+        params["subsample_freq"] = 1
+    return params
 
 
 CANDIDATES = {
@@ -197,7 +235,36 @@ def score(truth: np.ndarray, proba: np.ndarray, threshold: float,
     return out
 
 
-def run(frames: dict, chosen: list[str], threshold: float) -> pd.DataFrame:
+def fit_tuned(name: str, Xtr, ytr, both, yin, n_inner: int, threshold: float,
+              draws: int, rng) -> tuple[np.ndarray, float, float, dict]:
+    """Fit one candidate, optionally searching TUNE_SPACE, and pick the cutoff.
+
+    Everything here is decided on the INNER validation window and applied to
+    test once. Both choices - the hyperparameters and the warning cutoff - are
+    ranked by the same objective the table is judged on, so the search cannot
+    optimise one quantity while the table grades another.
+
+    No refit after the search: each draw already predicts inner AND test in one
+    call, so the winning draw's test predictions are simply kept. Refitting on
+    train+inner would change the model that produced the score being trusted.
+    """
+    best = None
+    grid = [{}] if (draws < 1 or name not in TUNABLE) else [
+        draw_params(rng, name) for _ in range(draws)]
+    for params in grid:
+        proba = np.asarray(CANDIDATES[name](Xtr, ytr, both, threshold=threshold,
+                                            **params), dtype=float)
+        warn, inner = metrics.best_threshold(
+            list(zip(yin.tolist(), proba[:n_inner].tolist())),
+            threshold, grid=PROBABILITY_GRID, default=0.5, objective=OBJECTIVE)
+        if best is None or inner > best[2]:
+            best = (proba, warn, inner, params)
+    return best
+
+
+def run(frames: dict, chosen: list[str], threshold: float,
+        draws: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(RANDOM_SEED)
     rows = []
     for horizon in HORIZONS:
         X, y = features.split_xy(frames[horizon])
@@ -211,15 +278,11 @@ def run(frames: dict, chosen: list[str], threshold: float) -> pd.DataFrame:
             Xte, yte = X[test], y[test]
             both = pd.concat([Xin, Xte])
             for name in chosen:
-                proba = np.asarray(CANDIDATES[name](
-                    Xtr, ytr, both, threshold=threshold), dtype=float)
-                # Cutoff chosen on inner, applied to test. Never the other way.
-                warn, _ = metrics.best_threshold(
-                    list(zip(yin.tolist(), proba[:len(Xin)].tolist())),
-                    threshold, grid=PROBABILITY_GRID, default=0.5,
-                    objective=OBJECTIVE)
+                proba, warn, inner, params = fit_tuned(
+                    name, Xtr, ytr, both, yin, len(Xin), threshold, draws, rng)
                 row = score(yte.to_numpy(), proba[len(Xin):], threshold, warn)
-                row.update(candidate=name, horizon=horizon, fold=fold_i)
+                row.update(candidate=name, horizon=horizon, fold=fold_i,
+                           inner_f2=inner, params=str(params))
                 rows.append(row)
                 print(f"  h={horizon:>2} fold {fold_i}  {name:<18} "
                       f"p>{warn:.2f}  recall {row['recall']:.2f}  "
@@ -324,6 +387,17 @@ def main() -> int:
     ap.add_argument("--window", type=int, default=TARGET_WINDOW,
                     help=f"hours the label spans from the target (default "
                          f"{TARGET_WINDOW}); 1 restores the single-hour label")
+    ap.add_argument("--tail", action="store_true",
+                    help="include features.py's spike-shaped columns (long lags, "
+                         "rolling max/min, exceedance recency, per-station "
+                         "z-score, Diwali). Off by default: the run WITHOUT them "
+                         "is the published table these are measured against.")
+    ap.add_argument("--tune", type=int, nargs="?", const=TUNE_DRAWS, default=0,
+                    metavar="N",
+                    help=f"random-search N draws from TUNE_SPACE per candidate, "
+                         f"horizon and fold, scored on inner validation "
+                         f"(default {TUNE_DRAWS} when the flag is given, 0 = off). "
+                         f"Applies to the tree candidates only.")
     ap.add_argument("--only", action="append", choices=list(CANDIDATES))
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -334,17 +408,20 @@ def main() -> int:
     wide = features.load_wide()
     print(f"building features ({len(wide.columns)} stations, {len(wide):,} hours)...",
           flush=True)
-    frames = {h: features.build(wide, h, None, spatial=False,
+    frames = {h: features.build(wide, h, None, spatial=False, tail=args.tail,
                                 target_window=args.window) for h in HORIZONS}
 
     chosen = args.only or list(CANDIDATES)
     if "persistence" not in chosen:
         chosen = ["persistence"] + chosen
+    print(f"tail features: {'ON' if args.tail else 'off'}   "
+          f"tuning: {args.tune or 'off'}   "
+          f"{len(frames[24].columns) - 1} feature columns at h=24")
     print(f"seed {RANDOM_SEED}   event: truth > {args.threshold:.0f} ug/m3 in "
           f"any of {args.window}h from the target, tuned on {OBJECTIVE.upper()}   "
           f"candidates: {', '.join(chosen)}\n")
 
-    results = run(frames, chosen, args.threshold)
+    results = run(frames, chosen, args.threshold, args.tune)
     if results.empty:
         sys.exit("no folds produced rows")
 
