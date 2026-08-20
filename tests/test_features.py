@@ -66,6 +66,53 @@ def ramp(drop: dict[int, set[int]] | None = None) -> pd.DataFrame:
 
 WIDE = ramp()
 
+# Weather fixture. Two cells for four stations, mirroring the real network where
+# 6 of 30 stations share a cell with a neighbour.
+#
+# The three series are separated by constants large enough to read off a failure
+# message, so a wrong column, a wrong hour or a wrong cell each show up as a
+# different number rather than as a near miss:
+#
+#     day1[t] = t                 day2[t] = t + 1e6      blh[t] = t + 2e6
+#
+# and cell B adds 5e5 on top. So "which column, which hour, which cell" is
+# answerable from the value alone. That is the same trick the PM2.5 ramp uses.
+CELLS = {1: (0.0, 0.0), 2: (0.0, 0.0), 3: (1.0, 1.0), 4: (1.0, 1.0)}
+DAY2_MARK, BLH_MARK, CELL_MARK = 1_000_000.0, 2_000_000.0, 500_000.0
+WX_VARS = ("wind_speed_10m", "wind_direction_10m", "temperature_2m",
+           "relative_humidity_2m", "precipitation")
+
+
+def weather_frames() -> dict[tuple[float, float], pd.DataFrame]:
+    index = pd.RangeIndex(START, START + N)
+    frames = {}
+    for cell, mark in (((0.0, 0.0), 0.0), ((1.0, 1.0), CELL_MARK)):
+        base = pd.Series([float(h) + mark for h in index], index=index)
+        cols = {}
+        for v in WX_VARS:
+            cols[f"{v}_previous_day1"] = base
+            cols[f"{v}_previous_day2"] = base + DAY2_MARK
+        cols["boundary_layer_height"] = base + BLH_MARK
+        frames[cell] = pd.DataFrame(cols, index=index)
+    return frames
+
+
+WX = weather_frames()
+
+
+def build(wide, horizon, coords=None, **kw):
+    """features.build with the fixture injected, never the real cache.
+
+    Every call site in this file goes through here. A leak gate that reads the
+    gitignored data/weather.csv does not run on a fresh clone, and it cannot
+    control what the forecast column holds - which is the one thing the weather
+    cases below have to assert.
+    """
+    kw.setdefault("cells", CELLS)
+    kw.setdefault("weather_frames", WX)
+    return features.build(wide, horizon, coords, **kw)
+
+
 print("-- the core assertion: nothing may come from after issue time --")
 # Only own-history columns carry a timestamp-as-value. Calendar columns are
 # trigonometric and station_id is an identifier, so both are excluded by name.
@@ -75,7 +122,7 @@ CALENDAR = {"hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin",
 worst_excess = float("-inf")
 checked_cells = 0
 for h in features.HORIZONS:
-    frame = features.build(WIDE, h, COORDS)
+    frame = build(WIDE, h, COORDS)
     for issue_hour, row in frame.iterrows():
         station = int(row["station_id"])
         for col, value in row.items():
@@ -85,6 +132,12 @@ for h in features.HORIZONS:
                 continue  # differences and spreads, not timestamps
             if col.startswith("nbr_") or col == "regional_mean":
                 continue  # mixed offsets; covered by its own case below
+            if col.startswith("wx_"):
+                # Weather is the one family allowed to carry a target-hour
+                # value, because the forecast was published before issue time.
+                # "Not later than issue hour" is the wrong test for it; the
+                # weather section below asserts the right one instead.
+                continue
             # Every remaining column is a level in this station's own units.
             worst_excess = max(worst_excess, value - OFFSET[station] - issue_hour)
             checked_cells += 1
@@ -96,7 +149,7 @@ check("lag_0 reaches issue hour exactly (excess is 0, not negative)",
 
 print("\n-- the target IS the future, and by exactly the horizon --")
 for h in features.HORIZONS:
-    frame = features.build(WIDE, h, COORDS)
+    frame = build(WIDE, h, COORDS)
     row = frame.iloc[len(frame) // 2]
     issue = frame.index[len(frame) // 2]
     station = int(row["station_id"])
@@ -108,7 +161,7 @@ for h in features.HORIZONS:
 print("\n-- lag_0 IS the persistence prediction --")
 # This identity is what makes the row-admission rule a fairness rule: if
 # persistence can always answer, every candidate is scored on the same rows.
-frame24 = features.build(WIDE, 24, COORDS)
+frame24 = build(WIDE, 24, COORDS)
 persistence_error = (frame24["_target"] - frame24["lag_0"]).abs().max()
 check("persistence error on a +1/hr ramp at h=24 is exactly 24",
       float(persistence_error), 24.0)
@@ -138,7 +191,7 @@ for span in features.TREND_SPANS:
 print("\n-- gaps are NOT forward-filled --")
 GAP_AT = START + 400
 gapped = ramp(drop={1: {GAP_AT}})   # station 1 only
-g = features.build(gapped, 24, COORDS)
+g = build(gapped, 24, COORDS)
 # The row issued 3h after the hole must show NaN at lag_3, not the last value.
 probe = g[(g["station_id"] == 1)].loc[GAP_AT + 3]
 check("lag_3 across a 1h hole is NaN", probe["lag_3"] != probe["lag_3"], True)
@@ -149,7 +202,7 @@ check("lag_6 (reaching past the hole) is unaffected, NOT shifted by the missing 
 
 print("\n-- a long gap stays NaN; there is no 3h fill and no 19h fill --")
 LONG = set(range(START + 200, START + 219))   # 19 hours, the observed block size
-longgap = features.build(ramp(drop={1: LONG}), 24, COORDS)
+longgap = build(ramp(drop={1: LONG}), 24, COORDS)
 one_lg = longgap[longgap["station_id"] == 1]
 after = one_lg.loc[START + 220]
 check("lag_2 into a 19h block is NaN", after["lag_2"] != after["lag_2"], True)
@@ -270,17 +323,125 @@ with tempfile.TemporaryDirectory() as tmp:
     check("nothing else is touched", float(col.iloc[5]), 55.0)
 
 print("\n-- determinism --")
-a1 = features.build(WIDE, 24, COORDS)
-a2 = features.build(WIDE, 24, COORDS)
+a1 = build(WIDE, 24, COORDS)
+a2 = build(WIDE, 24, COORDS)
 check("same input, byte-identical output", a1.equals(a2), True)
 
 print("\n-- a missing coordinate is refused, not silently NaN --")
 try:
-    features.build(WIDE, 24, {k: v for k, v in COORDS.items() if k != 4})
+    build(WIDE, 24, {k: v for k, v in COORDS.items() if k != 4})
     check("missing coords raises", "no exception", "ValueError")
 except ValueError as exc:
     check("missing coords raises ValueError naming the station",
           "4" in str(exc), True)
+
+print("\n-- weather: the forecast column, never the actuals --")
+# Weather is the only family whose value may carry a target-hour timestamp, so
+# the ramp rule above cannot police it. What has to hold instead is narrower and
+# stricter: the value must be the RIGHT lead, read at the RIGHT hour, from the
+# RIGHT cell. The fixture separates those three by constants, so a value that is
+# off by 1e6 read day2, off by 5e5 read the neighbouring cell, and off by the
+# horizon read the wrong hour.
+#
+# This is the case that matters. Training on what the weather actually did,
+# rather than on what the forecast said a day earlier, is an answer key the
+# model will never have in production - and it is invisible in the metrics,
+# because it makes the score better.
+SAFE_ISSUE = START + 200      # clear of both the ramp start and any 24h lookback
+SAFE_STATION = 3              # in cell B, so a wrong-cell read shows up as CELL_MARK
+
+
+def pick(frame, station=SAFE_STATION, issue=SAFE_ISSUE):
+    """One row, chosen by station and issue hour rather than by position.
+
+    Positional picking is what made the first version of this section fail: with
+    four station blocks concatenated, iloc[len // 2] lands on the FIRST issue
+    hour of a block, where a 24h backward difference is legitimately NaN.
+    """
+    rows = frame[frame["station_id"] == station]
+    assert issue in rows.index, f"issue hour {issue} not admitted for station {station}"
+    return rows.loc[issue]
+
+
+for h, mark in ((24, 0.0), (48, DAY2_MARK)):
+    frame = build(WIDE, h, COORDS, weather=True, blh="none")
+    row = pick(frame)
+    cell_mark = CELL_MARK if CELLS[SAFE_STATION] == (1.0, 1.0) else 0.0
+    want = float(SAFE_ISSUE + h) + mark + cell_mark
+    # The other lead read at the same hour. day2 sits DAY2_MARK above day1, so
+    # at h=24 the wrong answer is higher and at h=48 it is lower.
+    other = want + DAY2_MARK if h == 24 else want - DAY2_MARK
+    check(f"h={h}: wx_wind_speed is the day{1 if h == 24 else 2} value at the TARGET hour",
+          float(row["wx_wind_speed"]), want)
+    check(f"h={h}: it is NOT that lead read at the ISSUE hour",
+          float(row["wx_wind_speed"]) != float(SAFE_ISSUE) + mark + cell_mark, True)
+    check(f"h={h}: it is NOT the other lead at the target hour",
+          float(row["wx_wind_speed"]) != other, True)
+    check(f"h={h}: it is NOT the neighbouring cell",
+          float(row["wx_wind_speed"]) != want - CELL_MARK, True)
+    check(f"h={h}: wind direction is sin/cos of that same hour, period 360",
+          float(row["wx_wind_dir_sin"]), math.sin(2 * math.pi * want / 360))
+
+print("\n-- weather: 6h and 12h carry no weather at all --")
+# The lead-time archive is indexed in whole days, so these horizons have no
+# matching lead. Feeding them day1 would be a 24h-old forecast wearing a 6h
+# label, so they get nothing rather than something mislabelled.
+for h in (6, 12):
+    frame = build(WIDE, h, COORDS, weather=True, blh="target")
+    wx = [c for c in frame.columns if c.startswith("wx_")]
+    check(f"h={h}: zero wx_ columns even with blh=target", wx, [])
+for h in (24, 48):
+    frame = build(WIDE, h, COORDS, weather=True, blh="none")
+    wx = sorted(c for c in frame.columns if c.startswith("wx_"))
+    check(f"h={h}: the six forecast columns are present", len(wx), 6)
+
+print("\n-- weather: the lid at issue time is backward-looking --")
+# Variant B. This one is servable, so it must obey the ordinary rule.
+for h in (24, 48):
+    frame = build(WIDE, h, COORDS, weather=True, blh="issue")
+    worst = float("-inf")
+    n_cells = 0
+    for issue_hour, row in frame.iterrows():
+        cell_mark = 0.0 if CELLS[int(row["station_id"])] == (0.0, 0.0) else CELL_MARK
+        v = row["wx_blh_issue"]
+        if v == v:
+            worst = max(worst, float(v) - BLH_MARK - cell_mark - issue_hour)
+            n_cells += 1
+    check(f"h={h}: wx_blh_issue cells inspected", n_cells > 1000, True)
+    check(f"h={h}: wx_blh_issue never reads past the issue hour", worst <= 0, True)
+    check(f"h={h}: and it reaches the issue hour exactly", worst, 0.0)
+    check(f"h={h}: wx_blh_trend_24 is a 24h backward difference",
+          float(pick(frame)["wx_blh_trend_24"]), 24.0)
+    check(f"h={h}: and it is NaN where there is no 24h of history behind it",
+          math.isnan(float(frame[frame["station_id"] == SAFE_STATION]
+                           .loc[START, "wx_blh_trend_24"])), True)
+
+print("\n-- weather: the leaky ceiling variant is leaky ON PURPOSE, and opt-in --")
+# Variant C reads the lid at the target hour, which nobody knows at issue time.
+# It exists to price what a perfect lid forecast would buy and must never ship.
+# Asserting that it IS a leak is what stops it being mistaken for a safe column.
+frame = build(WIDE, 24, COORDS, weather=True, blh="target")
+row = pick(frame)
+cell_mark = CELL_MARK if CELLS[SAFE_STATION] == (1.0, 1.0) else 0.0
+check("wx_blh_target reads the TARGET hour, i.e. it is the answer key",
+      float(row["wx_blh_target"]) - BLH_MARK - cell_mark - SAFE_ISSUE, 24.0)
+check("and the issue-time lid would have been 24 hours lower",
+      float(row["wx_blh_target"]) - float(pick(
+          build(WIDE, 24, COORDS, weather=True, blh="issue"))["wx_blh_issue"]), 24.0)
+check("blh defaults to none, so the leak is never on by accident",
+      [c for c in build(WIDE, 24, COORDS).columns if "blh" in c], [])
+try:
+    build(WIDE, 24, COORDS, blh="lid")
+    check("blh='lid' raises", "no exception", "ValueError")
+except ValueError as exc:
+    check("blh='lid' raises ValueError naming the bad value", "lid" in str(exc), True)
+
+print("\n-- weather: a station with no grid cell is refused, not silently NaN --")
+try:
+    build(WIDE, 24, COORDS, cells={k: v for k, v in CELLS.items() if k != 4})
+    check("missing cell raises", "no exception", "ValueError")
+except ValueError as exc:
+    check("missing cell raises ValueError naming the station", "4" in str(exc), True)
 
 print()
 if failures:
