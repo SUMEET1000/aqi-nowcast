@@ -62,6 +62,8 @@ K_NEIGHBOURS = 3
 NEIGHBOUR_LAG = 6
 
 STATIONS_CACHE = os.path.join(os.path.dirname(CACHE), "stations.csv")
+CELLS_CACHE = os.path.join(os.path.dirname(CACHE), "weather_cells.csv")
+WEATHER_CACHE = os.path.join(os.path.dirname(CACHE), "weather.csv")
 
 STATIONS_QUERY = """
 SELECT station_id, station_name, latitude, longitude
@@ -100,6 +102,13 @@ def load_coords(path: str = STATIONS_CACHE) -> dict[int, tuple[float, float]]:
                 for r in csv.DictReader(fh)}
 
 
+def load_cells(path: str = CELLS_CACHE) -> dict[int, tuple[float, float]]:
+    """Station IDs -> the Open-Meteo grid cell each station resolves to."""
+    with open(path, encoding="utf-8") as fh:
+        return {int(r["station_id"]): (float(r["cell_lat"]), float(r["cell_lon"]))
+                for r in csv.DictReader(fh)}
+
+
 # A reading of exactly 0.0 ug/m3 is a dead sensor, not clean air, and it is
 # treated as MISSING rather than dropped from the table.
 #
@@ -130,6 +139,18 @@ def to_hour(timestamps: pd.Series) -> pd.Series:
     one, so this stays correct if the parsed resolution changes again.
     """
     return (timestamps - EPOCH) // pd.Timedelta("1h")
+
+
+def load_weather(path: str = WEATHER_CACHE) -> dict[tuple[float, float], pd.DataFrame]:
+    """Open-Meteo cache -> one epoch-hour-indexed frame per forecast cell."""
+    raw = pd.read_csv(path)
+    raw["epoch_hour"] = to_hour(pd.to_datetime(raw["hour"], utc=True))
+    return {
+        (float(cell_lat), float(cell_lon)): group.drop(
+            columns=["cell_lat", "cell_lon", "hour"]
+        ).set_index("epoch_hour").sort_index()
+        for (cell_lat, cell_lon), group in raw.groupby(["cell_lat", "cell_lon"])
+    }
 
 
 def load_wide(path: str = CACHE) -> pd.DataFrame:
@@ -189,13 +210,15 @@ def _cyclical(values: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
 def _station_block(wide: pd.DataFrame, station: int, horizon: int,
                    nbrs: dict[int, list[int]] | None,
                    spatial: bool, cyclical: bool,
-                   min_present: float) -> pd.DataFrame:
+                   min_present: float, weather: bool = True,
+                   blh: str = "none",
+                   weather_frame: pd.DataFrame | None = None) -> pd.DataFrame:
     """One station's rows, indexed by ISSUE hour.
 
     Every column below is a backward shift or a trailing window, so no value in
-    a row can carry a timestamp later than that row's index. The one exception
-    is `_target`, which is the future by definition and is the only negative
-    shift in this file.
+    a row can carry a timestamp later than that row's index. Forecast values
+    are also allowed to carry target-hour timestamps because they were issued
+    before the issue hour; `_target` is future by definition.
     """
     own = wide[station]
     block = pd.DataFrame(index=wide.index)
@@ -229,6 +252,26 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
             s, c = _cyclical(np.asarray(values, dtype=float), period)
             block[f"{name}_sin"], block[f"{name}_cos"] = s, c
 
+    if weather and horizon in (24, 48):
+        if weather_frame is None:
+            raise ValueError(f"no weather frame for station {station}")
+        lead = "previous_day1" if horizon == 24 else "previous_day2"
+        for name, column in (("wx_wind_speed", "wind_speed_10m"),
+                             ("wx_temp", "temperature_2m"),
+                             ("wx_rh", "relative_humidity_2m"),
+                             ("wx_precip", "precipitation")):
+            block[name] = weather_frame[f"{column}_{lead}"].shift(-horizon)
+        direction = weather_frame[f"wind_direction_10m_{lead}"].shift(-horizon)
+        sin, cos = _cyclical(direction.to_numpy(dtype=float), 360)
+        block["wx_wind_dir_sin"], block["wx_wind_dir_cos"] = sin, cos
+        if blh == "issue":
+            block["wx_blh_issue"] = weather_frame["boundary_layer_height"]
+            block["wx_blh_trend_24"] = (weather_frame["boundary_layer_height"]
+                                        - weather_frame["boundary_layer_height"].shift(24))
+        elif blh == "target":
+            # Deliberately reads the answer key; this exists to measure a ceiling and must never become the default.
+            block["wx_blh_target"] = weather_frame["boundary_layer_height"].shift(-horizon)
+
     block["station_id"] = station
     block["_target"] = own.shift(-horizon)
     return block
@@ -237,7 +280,11 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
 def build(wide: pd.DataFrame, horizon: int,
           coords: dict[int, tuple[float, float]] | None = None,
           spatial: bool = True, cyclical: bool = True,
-          min_present: float = MIN_PRESENT) -> pd.DataFrame:
+          min_present: float = MIN_PRESENT, weather: bool = True,
+          blh: str = "none",
+          cells: dict[int, tuple[float, float]] | None = None,
+          weather_frames: dict[tuple[float, float], pd.DataFrame] | None = None
+          ) -> pd.DataFrame:
     """All stations stacked. One row = one forecast, indexed by issue hour.
 
     ROW ADMISSION: a row survives only when the target is present AND lag_0 is
@@ -250,6 +297,9 @@ def build(wide: pd.DataFrame, horizon: int,
     over whatever it happened to reach gave persistence 49,993 pairs against
     climatology's 7,534 — two error figures off two different sets of hours.
     """
+    if blh not in {"none", "issue", "target"}:
+        raise ValueError(f"blh must be one of none, issue, target; got {blh!r}")
+
     nbrs = neighbours(coords) if (spatial and coords) else None
     if spatial and nbrs is not None:
         # A station with history but no coordinates would silently lose its
@@ -260,7 +310,33 @@ def build(wide: pd.DataFrame, horizon: int,
             raise ValueError(f"no coordinates for station(s) {missing}; "
                              "re-run --pull-stations or pass spatial=False")
 
-    blocks = [_station_block(wide, s, horizon, nbrs, spatial, cyclical, min_present)
+    if not (weather and horizon in (24, 48)):
+        cells = weather_frames = None
+    else:
+        # Read from the cache unless a caller supplied frames. tests/test_features.py
+        # supplies its own: a leak gate that loads the real gitignored cache is not
+        # runnable on a fresh clone, and it cannot control what the forecast column
+        # holds, which is the one thing the weather cases have to assert.
+        if cells is None:
+            cells = load_cells()
+        if weather_frames is None:
+            weather_frames = load_weather()
+        # The completed hourly history index makes every shift an hourly lead,
+        # including across outages in either source.
+        weather_frames = {cell: frame.reindex(wide.index)
+                          for cell, frame in weather_frames.items()}
+        missing = [s for s in wide.columns if s not in cells]
+        if missing:
+            raise ValueError(f"no weather cell for station(s) {missing}; "
+                             "re-run scripts/weather.py --pull-cells")
+        missing_frames = [s for s in wide.columns if cells[s] not in weather_frames]
+        if missing_frames:
+            raise ValueError(f"no weather data for station(s) {missing_frames}; "
+                             "re-run scripts/weather.py --pull")
+
+    blocks = [_station_block(
+        wide, s, horizon, nbrs, spatial, cyclical, min_present, weather, blh,
+        weather_frames[cells[s]] if weather_frames is not None else None)
               for s in wide.columns]
     out = pd.concat(blocks)
     out.index.name = "issue_hour"
@@ -299,12 +375,13 @@ def main() -> int:
     for h in HORIZONS:
         frame = build(wide, h, coords, spatial=coords is not None)
         X, y = split_xy(frame)
-        if h == HORIZONS[0]:
-            print(f"{len(X.columns)} feature columns:")
-            print("  " + ", ".join(X.columns) + "\n")
+        wx_count = sum(column.startswith("wx_") for column in X.columns)
+        print(f"horizon {h:>2}h: {len(X.columns)} feature columns "
+              f"({wx_count} wx_ columns):")
+        print("  " + ", ".join(X.columns))
         severe = int((y > SEVERE_ABOVE).sum())
         print(f"horizon {h:>2}h: {len(X):>7,} rows, {severe:>5,} severe, "
-              f"{X.isna().mean().mean():.1%} of feature cells NaN")
+              f"{X.isna().mean().mean():.1%} of feature cells NaN\n")
     return 0
 
 
