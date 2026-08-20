@@ -371,11 +371,83 @@ And weather at that grid cannot move the alert. Station-level PM2.5 in this netw
 local conditions — traffic, construction, the sensor itself — not by anything a regional weather
 model resolves.
 
+### Asking the model the actual question
+
+Every candidate above is a **regressor**: it predicts a concentration, and the alert comes from
+thresholding it. That is the wrong shape of model for a yes/no decision, and the inverted table
+above is what it looks like. So the question was re-asked directly — predict the *probability
+of exceedance*, and grade it on the decision.
+
+Three things change, and only the first is a modelling choice.
+
+**The event is 121 µg/m³, CPCB's Very Poor band, not the 250 the table above used.** At 250 the
+positive rate is 2.0%; at 121 it is 13.4%, seven times more events to learn from. That is a
+product decision: a parent deciding about a child with asthma does not wait for CPCB to say
+Severe. The comparison stays honest because persistence is scored at the same threshold on the
+same rows.
+
+**The label spans three hours from the target, not one.** A subscriber asks whether the evening
+is safe, not whether 19:00 exactly crosses a line. Row admission still keys on the point target,
+so the rows are identical to the tables above and everything stays comparable.
+
+**The objective is F2, and the baseline can tune.** F2 weights recall four times precision: a
+miss sends a child outside, a false alarm keeps them in on a clean day. The baseline detail is
+the one that mattered most — see the honesty note below.
+
+Measured **2026-08-20**, `python scripts/classify.py --tail --tune`. Five candidates × four
+horizons × four folds, warning cutoff fitted on inner validation and applied to test once.
+
+| horizon | persistence F2 | best model F2 | margin | fold std | clears the bar | persistence AP | best AP |
+|---|---|---|---|---|---|---|---|
+| 6h | 0.508 | 0.618 | +0.110 | 0.125 | no | 0.377 | 0.521 |
+| **12h** | 0.468 | **0.594** | **+0.125** | 0.122 | **yes** | 0.297 | 0.467 |
+| 24h | 0.525 | 0.579 | +0.054 | 0.139 | no | 0.387 | 0.472 |
+| 48h | 0.496 | 0.559 | +0.063 | 0.120 | no | 0.333 | 0.401 |
+
+**One horizon of four clears the bar, and it is the one the product needs.** The message goes
+out at 07:00 IST; 12h from there is the evening peak. Persistence is strong at 24h and 48h
+because those are whole multiples of the daily cycle — "the same hour yesterday" lands on the
+same point of the pollution day — and weak at 6h and 12h, where it compares opposite phases.
+
+**Average precision needs no cutoff and favours the model at every horizon**, by 38% at 6h and
+57% at 12h. The ranking is genuinely better than persistence everywhere; a single tuned cutoff
+converts that into a passing margin at one horizon. That gap between "ranks well" and "decides
+well" is the honest summary of this stage.
+
+Getting there took two things, and their effects are worth separating:
+
+| horizon | at library defaults, base features | + spike features | + hyperparameter search |
+|---|---|---|---|
+| 6h | 0.610 | 0.615 | 0.618 |
+| 12h | 0.573 | **0.582** | 0.594 |
+| 24h | 0.563 | 0.575 | 0.579 |
+| 48h | 0.518 | 0.532 | 0.559 |
+
+**The features moved the gate; the tuning did not.** Rolling max and min, 72h and 168h lags,
+exceedance recency, a per-station z-score and a signed distance from Diwali took 12h from just
+short to just clear. The random search then raised F2 and average precision at every horizon —
+and raised the fold-to-fold spread by about as much, so no verdict changed. Reporting the F2
+gain without the variance beside it would make tuning look like a win it is not. Nothing in this
+project had ever been hyperparameter-tuned before this run; the answer is that it was worth
+about as much as the noise it added.
+
+**An honesty note, because it changed the entire result.** The first version of this table had
+the model beating persistence at all four horizons. It was wrong. Persistence was implemented as
+a hard yes/no at 121 µg/m³ while every rival slid its cutoff to wherever F2 peaked — and under a
+recall-weighted objective the side allowed to tune wins by construction. The fix is one line:
+persistence returns its reading on a 0–1 scale, so tuning that cutoff *is* tuning "warn when the
+current reading is above X". Persistence F2 rose from 0.294–0.388 to 0.468–0.525 and a 4-of-4
+win became 0-of-4. Two smaller faults were found in the same pass: the label was one clock hour
+when the decision is about an evening, and the tuner optimised CSI while the table reported F2.
+**The corrected metric produced a better-looking answer than the broken one, which is exactly
+when to audit hardest.**
+
 ### What it needs
 
-Not weather, on this evidence. The remaining levers are a finer-grained exposure signal than
-any free product currently offers, or accepting that persistence is the honest baseline for the
-alert and shipping it as such.
+Not weather, on this evidence. What is still untried is calibration — nothing yet checks whether
+a predicted probability means anything, which a message saying "70% chance" would require — and
+a per-station breakdown, since every number here is averaged over 30 stations and may be hiding
+stations the alert would serve badly.
 
 ### Method notes
 
