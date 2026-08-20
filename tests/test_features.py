@@ -117,12 +117,16 @@ print("-- the core assertion: nothing may come from after issue time --")
 # Only own-history columns carry a timestamp-as-value. Calendar columns are
 # trigonometric and station_id is an identifier, so both are excluded by name.
 CALENDAR = {"hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin",
-            "month_cos", "station_id", "_target"}
+            "month_cos", "station_id", "_target", "diwali_days"}
+# Tail columns whose value is not a timestamp in this station's units, so the
+# "not later than issue hour" arithmetic does not apply to them. They get their
+# own cases below; nothing may be added here without one.
+NOT_A_TIMESTAMP = {"hours_since_exceed", f"z_{features.Z_WINDOW}"}
 
 worst_excess = float("-inf")
 checked_cells = 0
 for h in features.HORIZONS:
-    frame = build(WIDE, h, COORDS)
+    frame = build(WIDE, h, COORDS, tail=True)
     for issue_hour, row in frame.iterrows():
         station = int(row["station_id"])
         for col, value in row.items():
@@ -130,6 +134,10 @@ for h in features.HORIZONS:
                 continue
             if col.startswith("trend_") or col.startswith("roll_std_"):
                 continue  # differences and spreads, not timestamps
+            if col in NOT_A_TIMESTAMP:
+                continue  # counts, distances and z-scores, not levels
+            if col.startswith("exceed_count_"):
+                continue
             if col.startswith("nbr_") or col == "regional_mean":
                 continue  # mixed offsets; covered by its own case below
             if col.startswith("wx_"):
@@ -466,6 +474,87 @@ for h in (6, 24):
     check(f"h={h}: w=1 is identical to no window at all",
           build(WIDE, h, COORDS, target_window=1)["_target"].equals(point["_target"]),
           True)
+
+print("\n-- tail features are OFF by default --")
+plain = build(WIDE, 24, COORDS)
+tailed = build(WIDE, 24, COORDS, tail=True)
+check("no tail column appears without tail=True",
+      any(c.startswith(("roll_max_", "exceed_count_")) or c in
+          ("lag_72", "hours_since_exceed", "diwali_days") for c in plain.columns),
+      False)
+check("tail=True adds columns and admits the same rows", len(tailed), len(plain))
+check("tail=True does not change the target",
+      tailed["_target"].equals(plain["_target"]), True)
+
+print("\n-- long lags and rolling max/min end at issue time --")
+trow = tailed[tailed["station_id"] == 1].loc[SAFE_ISSUE]
+for lag in features.TAIL_LAGS:
+    check(f"lag_{lag} == issue - {lag}", trow[f"lag_{lag}"] - SAFE_ISSUE, float(-lag))
+for w in features.ROLL_WINDOWS:
+    # On a rising ramp the trailing max IS issue time and the min is w-1 back.
+    check(f"roll_max_{w} is the value AT issue time, not after it",
+          trow[f"roll_max_{w}"] - SAFE_ISSUE, 0.0)
+    check(f"roll_min_{w} is w-1 hours back", trow[f"roll_min_{w}"] - SAFE_ISSUE,
+          float(-(w - 1)))
+
+print("\n-- exceedance recency counts the past, never the target --")
+# A CALM fixture, not the ramp. Every value on the ramp is an epoch hour, i.e.
+# ~490,000 ug/m3, so on it every single hour is an exceedance and the counts
+# saturate - which is what these cases first caught. Here the air sits near
+# 50 ug/m3 and only hours 100-102 of station 1 cross the line, so the counts and
+# the recency are hand-computable. The +h%7 wobble keeps the trailing std above
+# zero, or the z-score would be 0/0.
+SPIKE_AT = START + 100
+spike = pd.DataFrame({s_: [50.0 + (h % 7) for h in WIDE.index] for s_ in STATIONS},
+                     index=WIDE.index)
+spike.loc[SPIKE_AT:SPIKE_AT + 2, 1] = 500.0
+sf = build(spike, 24, COORDS, tail=True)
+one = sf[sf["station_id"] == 1]
+check("hours_since_exceed is 0 during the exceedance",
+      float(one.loc[SPIKE_AT + 2, "hours_since_exceed"]), 0.0)
+check("hours_since_exceed is 5 five hours later",
+      float(one.loc[SPIKE_AT + 7, "hours_since_exceed"]), 5.0)
+check(f"hours_since_exceed is capped at {features.SINCE_CAP}",
+      float(one.loc[SPIKE_AT + 400, "hours_since_exceed"]), float(features.SINCE_CAP))
+check("hours_since_exceed is NaN before any exceedance ever happened",
+      one.loc[SPIKE_AT - 10, "hours_since_exceed"] != one.loc[SPIKE_AT - 10, "hours_since_exceed"],
+      True)
+check("exceed_count_24 counts all three spike hours",
+      float(one.loc[SPIKE_AT + 2, "exceed_count_24"]), 3.0)
+check("exceed_count_24 does NOT see the spike an hour before it",
+      float(one.loc[SPIKE_AT - 1, "exceed_count_24"]), 0.0)
+check("exceed_count_24 has forgotten it a day later",
+      float(one.loc[SPIKE_AT + 26, "exceed_count_24"]), 0.0)
+check("exceed_count_72 still remembers it a day later",
+      float(one.loc[SPIKE_AT + 26, "exceed_count_72"]), 3.0)
+check("a station that never spiked counts zero",
+      float(sf[sf["station_id"] == 2].loc[SPIKE_AT + 2, "exceed_count_24"]), 0.0)
+
+print("\n-- the z-score is per station, and reads its own trailing window --")
+z = f"z_{features.Z_WINDOW}"
+# On a pure ramp every station has the identical trailing shape, so the z-score
+# must be identical across stations despite offsets of 100000 - which is the
+# whole point of normalising per station.
+zs = [float(tailed[tailed["station_id"] == st].loc[SAFE_ISSUE, z]) for st in STATIONS]
+check("identical for every station on an identical ramp",
+      max(zs) - min(zs) < 1e-9, True)
+check("positive at the top of a rising window", zs[0] > 0, True)
+check("a spike is a large positive z-score against that station's own history",
+      float(one.loc[SPIKE_AT + 1, z]) > 5.0, True)
+check("a calm station at the same hour is not",
+      abs(float(sf[sf["station_id"] == 2].loc[SPIKE_AT + 1, z])) < 3.0, True)
+
+print("\n-- the Diwali column is a calendar, clipped both sides --")
+d = tailed["diwali_days"]
+check("never exceeds the window", float(d.abs().max()) <= features.DIWALI_WINDOW, True)
+check("is zero on Diwali itself",
+      float(features._diwali_days(features.to_hour(pd.Series(pd.to_datetime(
+          ["2025-10-20T12:00:00+05:30"]))).to_numpy())[0]), 0.0)
+check("is negative the day before, positive the day after",
+      [float(v) for v in features._diwali_days(features.to_hour(pd.Series(
+          pd.to_datetime(["2025-10-19T12:00:00+05:30",
+                          "2025-10-21T12:00:00+05:30"]))).to_numpy())],
+      [-1.0, 1.0])
 
 print()
 if failures:
