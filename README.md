@@ -517,7 +517,7 @@ file.
 - Air quality measurements: **Central Pollution Control Board (CPCB)**, via
   [data.gov.in](https://data.gov.in) resource `3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69` and
   [OpenAQ](https://openaq.org).
-- Weather and air-quality reanalysis: [Open-Meteo](https://open-meteo.com) (CAMS model output on
-  an ~11km grid — model data, not measurements).
+- Weather reanalysis and forecast: [Open-Meteo](https://open-meteo.com) — model output, not
+  measurements, on a grid measured at 0.0703° × 0.1023° (~7.8 km × ~10 km) over Haryana.
 
 This project is not affiliated with or endorsed by CPCB.
