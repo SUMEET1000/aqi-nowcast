@@ -66,15 +66,43 @@ DEFAULT_THRESHOLD = 121.0
 # true event, so the textbook 0.5 is one candidate here and not the default.
 PROBABILITY_GRID = [round(0.01 * i, 2) for i in range(1, 100)]
 
+# Hours the label spans, starting at the target hour. A subscriber asks whether
+# the EVENING is safe, not whether 19:00 exactly crosses a line, and scoring one
+# clock hour marks a model that was right about 18:00 and wrong about 19:00 as a
+# total miss. Three hours is the shortest span that still reads as "an evening".
+TARGET_WINDOW = 3
+
+# The cutoff is tuned on this, and the table is judged on it. F2 weights recall
+# four times precision: a miss sends a child out into bad air, a false alarm
+# keeps them in on a clean day, and CSI's 1:1 weighting answers that question
+# wrongly rather than declining to answer it. CSI and ETS are reported beside it,
+# CSI for comparability with the stage 1 table and ETS because it subtracts the
+# hits a coin-flipper collects at a 13% base rate.
+OBJECTIVE = "f2"
+
+
+# Divisor for the persistence score. Any constant above the observed maximum
+# works: the transform only has to be MONOTONE, because tuning a cutoff on
+# lag_0/SCALE is then identical to tuning one on lag_0 itself. 1650 is the
+# largest reading in the history, so nothing clips.
+PERSISTENCE_SCALE = 1650.0
+
 
 def fit_persistence(Xtr, ytr, Xte, threshold, **_):
-    """The bar. Warn when the reading AT ISSUE TIME is already above the line.
+    """The bar: warn when the reading AT ISSUE TIME is high enough.
 
-    Returned as a probability of exactly 0 or 1 so it goes through the identical
-    scoring path as everything else. It cannot be improved by cutoff tuning,
-    which is the point: it is the honest thing a person does without a model.
+    Returns lag_0 on a 0-1 scale rather than a hard yes/no at the event
+    threshold, so the cutoff search tunes this baseline on inner validation
+    exactly as it tunes every model.
+
+    That matters more than it looks. The first version answered a fixed 0 or 1
+    at 121 ug/m3, which pins persistence to one operating point while every rival
+    slides its cutoff to wherever the objective peaks. Under a recall-weighted
+    objective like F2 the tunable side then wins BY CONSTRUCTION, and the margin
+    measures who was allowed to tune rather than who forecasts better. A monotone
+    rescale costs nothing and removes the asymmetry.
     """
-    return (Xte["lag_0"] > threshold).to_numpy(dtype=float)
+    return (Xte["lag_0"].to_numpy(dtype=float) / PERSISTENCE_SCALE).clip(0.0, 1.0)
 
 
 def fit_logistic(Xtr, ytr, Xte, **_):
@@ -188,13 +216,15 @@ def run(frames: dict, chosen: list[str], threshold: float) -> pd.DataFrame:
                 # Cutoff chosen on inner, applied to test. Never the other way.
                 warn, _ = metrics.best_threshold(
                     list(zip(yin.tolist(), proba[:len(Xin)].tolist())),
-                    threshold, grid=PROBABILITY_GRID, default=0.5)
+                    threshold, grid=PROBABILITY_GRID, default=0.5,
+                    objective=OBJECTIVE)
                 row = score(yte.to_numpy(), proba[len(Xin):], threshold, warn)
                 row.update(candidate=name, horizon=horizon, fold=fold_i)
                 rows.append(row)
                 print(f"  h={horizon:>2} fold {fold_i}  {name:<18} "
                       f"p>{warn:.2f}  recall {row['recall']:.2f}  "
-                      f"prec {row['precision']:.2f}  CSI {row['csi']:.3f}  "
+                      f"prec {row['precision']:.2f}  F2 {row['f2']:.3f}  "
+                      f"CSI {row['csi']:.3f}  ETS {row['ets']:.3f}  "
                       f"AP {row['ap']:.3f}", flush=True)
     return pd.DataFrame(rows)
 
@@ -202,9 +232,11 @@ def run(frames: dict, chosen: list[str], threshold: float) -> pd.DataFrame:
 def summarise(results: pd.DataFrame) -> pd.DataFrame:
     g = results.groupby(["candidate", "horizon"])
     return pd.DataFrame({
+        "f2": g["f2"].mean(), "f2_std": g["f2"].std(ddof=1),
         "csi": g["csi"].mean(), "csi_std": g["csi"].std(ddof=1),
+        "ets": g["ets"].mean(),
         "recall": g["recall"].mean(), "precision": g["precision"].mean(),
-        "f1": g["f1"].mean(), "ap": g["ap"].mean(),
+        "ap": g["ap"].mean(),
         "events": g["events"].sum(), "n": g["n"].sum(),
     }).reset_index()
 
@@ -224,16 +256,19 @@ def verdict(summary: pd.DataFrame, threshold: float) -> str:
         at = summary[summary["horizon"] == h].set_index("candidate")
         if "persistence" not in at.index or len(at) < 2:
             continue
-        base = float(at.loc["persistence", "csi"])
+        base = float(at.loc["persistence", OBJECTIVE])
         rivals = at.drop(index="persistence")
-        win = rivals["csi"].idxmax()
-        got, spread = float(rivals.loc[win, "csi"]), float(at.loc[win, "csi_std"])
+        win = rivals[OBJECTIVE].idxmax()
+        got = float(rivals.loc[win, OBJECTIVE])
+        spread = float(at.loc[win, f"{OBJECTIVE}_std"])
         beat = (got - base) > spread
         won.append(beat)
-        rows.append({"horizon": f"{h}h", "persistence CSI": round(base, 3),
-                     "best": win, "CSI": round(got, 3),
+        rows.append({"horizon": f"{h}h", "persistence F2": round(base, 3),
+                     "best": win, "F2": round(got, 3),
                      "margin": round(got - base, 3), "fold std": round(spread, 3),
                      "beats baseline": "yes" if beat else "no",
+                     "best CSI": round(float(rivals.loc[win, "csi"]), 3),
+                     "best ETS": round(float(rivals.loc[win, "ets"]), 3),
                      "persistence AP": round(float(at.loc["persistence", "ap"]), 3),
                      "best AP": round(float(rivals.loc[win, "ap"]), 3)})
     if not rows:
@@ -241,7 +276,7 @@ def verdict(summary: pd.DataFrame, threshold: float) -> str:
     out = [f"event: truth above {threshold:.0f} ug/m3", "",
            _md(pd.DataFrame(rows), "{:.3f}"), "",
            f"VERDICT: beats persistence at {sum(won)} of {len(won)} horizons on "
-           f"CSI, by more than the fold-to-fold spread.",
+           f"{OBJECTIVE.upper()}, by more than the fold-to-fold spread.",
            "AP is threshold-free and is the honest read on ranking quality. CSI "
            "rests on one tuned cutoff and carries the larger variance, so a tie "
            "on CSI beside a large AP gap means the ranking improved and the "
@@ -286,6 +321,9 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                     help=f"alert threshold in ug/m3 (default {DEFAULT_THRESHOLD:.0f}, "
                          "CPCB's Very Poor band)")
+    ap.add_argument("--window", type=int, default=TARGET_WINDOW,
+                    help=f"hours the label spans from the target (default "
+                         f"{TARGET_WINDOW}); 1 restores the single-hour label")
     ap.add_argument("--only", action="append", choices=list(CANDIDATES))
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -296,12 +334,14 @@ def main() -> int:
     wide = features.load_wide()
     print(f"building features ({len(wide.columns)} stations, {len(wide):,} hours)...",
           flush=True)
-    frames = {h: features.build(wide, h, None, spatial=False) for h in HORIZONS}
+    frames = {h: features.build(wide, h, None, spatial=False,
+                                target_window=args.window) for h in HORIZONS}
 
     chosen = args.only or list(CANDIDATES)
     if "persistence" not in chosen:
         chosen = ["persistence"] + chosen
-    print(f"seed {RANDOM_SEED}   event: truth > {args.threshold:.0f} ug/m3   "
+    print(f"seed {RANDOM_SEED}   event: truth > {args.threshold:.0f} ug/m3 in "
+          f"any of {args.window}h from the target, tuned on {OBJECTIVE.upper()}   "
           f"candidates: {', '.join(chosen)}\n")
 
     results = run(frames, chosen, args.threshold)

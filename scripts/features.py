@@ -51,6 +51,11 @@ ROLL_WINDOWS = (6, 24)
 # ablation questions.
 MIN_PRESENT = 0.5
 
+# Hours the label spans, starting at the target hour. 1 reproduces the stage 1
+# and stage 3 tables exactly; scripts/classify.py raises it, because the decision
+# a subscriber makes is about a stretch of the evening rather than one clock hour.
+TARGET_WINDOW = 1
+
 # Trend terms: value now minus value this many hours ago. 120 on the way up is a
 # different situation from 120 on the way down, and no single lag says which.
 TREND_SPANS = (3, 6)
@@ -212,7 +217,8 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
                    spatial: bool, cyclical: bool,
                    min_present: float, weather: bool = False,
                    blh: str = "none",
-                   weather_frame: pd.DataFrame | None = None) -> pd.DataFrame:
+                   weather_frame: pd.DataFrame | None = None,
+                   target_window: int = 1) -> pd.DataFrame:
     """One station's rows, indexed by ISSUE hour.
 
     Every column below is a backward shift or a trailing window, so no value in
@@ -273,7 +279,21 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
             block["wx_blh_target"] = weather_frame["boundary_layer_height"].shift(-horizon)
 
     block["station_id"] = station
-    block["_target"] = own.shift(-horizon)
+    point = own.shift(-horizon)
+    if target_window > 1:
+        # "Is this evening safe?" is a question about a stretch of hours, not
+        # about 19:00 exactly. Scoring a single hour marks a model that was right
+        # about 18:00 and wrong about 19:00 as a total miss, which is not the
+        # mistake the subscriber experienced.
+        #
+        # Admission still keys on the POINT target, so the admitted rows are
+        # identical to the target_window=1 case and the two tables compare. Only
+        # the label changes.
+        window = pd.concat([own.shift(-(horizon + i)) for i in range(target_window)],
+                           axis=1).max(axis=1)
+        block["_target"] = window.where(point.notna())
+    else:
+        block["_target"] = point
     return block
 
 
@@ -281,7 +301,7 @@ def build(wide: pd.DataFrame, horizon: int,
           coords: dict[int, tuple[float, float]] | None = None,
           spatial: bool = True, cyclical: bool = True,
           min_present: float = MIN_PRESENT, weather: bool = False,
-          blh: str = "none",
+          blh: str = "none", target_window: int = TARGET_WINDOW,
           cells: dict[int, tuple[float, float]] | None = None,
           weather_frames: dict[tuple[float, float], pd.DataFrame] | None = None
           ) -> pd.DataFrame:
@@ -336,7 +356,8 @@ def build(wide: pd.DataFrame, horizon: int,
 
     blocks = [_station_block(
         wide, s, horizon, nbrs, spatial, cyclical, min_present, weather, blh,
-        weather_frames[cells[s]] if weather_frames is not None else None)
+        weather_frames[cells[s]] if weather_frames is not None else None,
+        target_window)
               for s in wide.columns]
     out = pd.concat(blocks)
     out.index.name = "issue_hour"
