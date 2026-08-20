@@ -384,16 +384,24 @@ MODEL_ABLATIONS = [
 
 # (question, options as build() kwargs) — these need the frame rebuilt.
 FEATURE_ABLATIONS = [
-    ("spatial features", [("with", {"spatial": True}), ("without", {"spatial": False})]),
-    ("calendar sin/cos", [("with", {"cyclical": True}), ("without", {"cyclical": False})]),
-    ("rolling presence threshold",
+    ("spatial features", "lightgbm", "mae",
+     [("with", {"spatial": True}), ("without", {"spatial": False})]),
+    ("calendar sin/cos", "lightgbm", "mae",
+     [("with", {"cyclical": True}), ("without", {"cyclical": False})]),
+    ("rolling presence threshold", "lightgbm", "mae",
      [("50%", {"min_present": 0.5}), ("75%", {"min_present": 0.75}),
       ("any", {"min_present": 0.0})]),
+    ("weather features", "lightgbm-q90", "csi",
+     [("no weather", {"weather": False}),
+      ("forecast only", {"weather": True, "blh": "none"}),
+      ("forecast + lid now", {"weather": True, "blh": "issue"}),
+      ("forecast + lid future (LEAKY, ceiling only)",
+       {"weather": True, "blh": "target"})]),
 ]
 
 
-def _inner_mae(frame, candidate, **kw) -> tuple[float, float]:
-    """Mean and std of inner-validation MAE across folds. Never touches test."""
+def _inner_score(frame, candidate, **kw) -> dict[str, float]:
+    """Inner-validation MAE and fixed-cutoff alert scores across folds."""
     X, y = features.split_xy(frame)
     scores = []
     for fold in FOLDS:
@@ -401,27 +409,36 @@ def _inner_mae(frame, candidate, **kw) -> tuple[float, float]:
         if not train.any() or not inner.any():
             continue
         pred = CANDIDATES[candidate](X[train], y[train], X[inner], **kw)
-        scores.append(metrics.errors(list(zip(
-            y[inner].tolist(), np.clip(pred, 0, None).tolist())))[0])
-    return float(np.mean(scores)), float(np.std(scores, ddof=1))
+        pairs = list(zip(y[inner].tolist(), np.clip(pred, 0, None).tolist()))
+        alert = metrics.exceedance(pairs, ALERT_THRESHOLD)
+        scores.append({"inner MAE": metrics.errors(pairs)[0],
+                       "inner recall": alert["recall"], "inner CSI": alert["csi"]})
+    result = pd.DataFrame(scores)
+    return {"mae": float(result["inner MAE"].mean()),
+            "mae_std": float(result["inner MAE"].std(ddof=1)),
+            "ex_recall": float(result["inner recall"].mean()),
+            "ex_csi": float(result["inner CSI"].mean()),
+            "csi_std": float(result["inner CSI"].std(ddof=1))}
 
 
-def ablate(wide: pd.DataFrame, coords) -> str:
+def ablate(wide: pd.DataFrame, coords, weather: bool = False,
+           blh: str = "none") -> str:
     """The table that turns preprocessing folklore into measurements."""
     out = ["## Ablations — decided on inner validation, never on test",
            f"\nHorizon {ABLATION_HORIZON}h, {len(FOLDS)} folds, "
-           f"seed {RANDOM_SEED}. Lower MAE is better.\n"]
-    base = features.build(wide, ABLATION_HORIZON, coords, spatial=coords is not None)
+           f"seed {RANDOM_SEED}. Lower MAE is better, higher CSI is better, and each question names the one it is ranked on.\n"]
+    base = features.build(wide, ABLATION_HORIZON, coords,
+                          spatial=coords is not None, weather=weather, blh=blh)
 
     for question, candidate, kwarg, options in MODEL_ABLATIONS:
         if len(options) < 2:
             continue
         rows = []
         for opt in options:
-            mae, sd = _inner_mae(base, candidate, **{kwarg: opt})
-            rows.append({"option": opt, "inner MAE": round(mae, 3),
-                         "fold std": round(sd, 3)})
-            print(f"  {question:<38} {opt:<10} {mae:7.3f}", flush=True)
+            score = _inner_score(base, candidate, **{kwarg: opt})
+            rows.append({"option": opt, "inner MAE": round(score["mae"], 3),
+                         "fold std": round(score["mae_std"], 3)})
+            print(f"  {question:<38} {opt:<10} {score['mae']:7.3f}", flush=True)
         df = pd.DataFrame(rows).sort_values("inner MAE")
         spread = df["fold std"].max()
         gap = df["inner MAE"].iloc[-1] - df["inner MAE"].iloc[0]
@@ -432,29 +449,51 @@ def ablate(wide: pd.DataFrame, coords) -> str:
                    "**within the noise, so the simpler option wins.**")]
 
     # Trees are expected to be indifferent to scaling. Demonstrated, not asserted.
-    plain, _ = _inner_mae(base, "lightgbm")
+    plain = _inner_score(base, "lightgbm")["mae"]
     out += [f"\n**LightGBM and scaling**: trees split on order, and order does not "
             f"change under scaling, so a scaler cannot move a tree. Inner MAE "
             f"{plain:.3f} either way — the row exists to show it rather than to "
             f"assert it. Scaling a tree is cargo cult."]
 
-    for question, options in FEATURE_ABLATIONS:
+    for question, candidate, rank, options in FEATURE_ABLATIONS:
         rows = []
         for label, kwargs in options:
             if kwargs.get("spatial") and coords is None:
                 continue
             frame = features.build(wide, ABLATION_HORIZON, coords,
-                                   **{"spatial": coords is not None, **kwargs})
-            mae, sd = _inner_mae(frame, "lightgbm")
-            rows.append({"option": label, "inner MAE": round(mae, 3),
-                         "fold std": round(sd, 3), "cols": frame.shape[1] - 1})
-            print(f"  {question:<38} {label:<10} {mae:7.3f}", flush=True)
+                                   **{"spatial": coords is not None,
+                                      "weather": weather, "blh": blh, **kwargs})
+            score = _inner_score(frame, candidate)
+            row = {"option": label, "inner MAE": round(score["mae"], 3),
+                   "fold std": round(score["mae_std"], 3),
+                   "cols": frame.shape[1] - 1}
+            if rank == "csi":
+                row.update({"inner recall": round(score["ex_recall"], 3),
+                            "inner CSI": round(score["ex_csi"], 3),
+                            "CSI fold std": round(score["csi_std"], 3)})
+            rows.append(row)
+            print(f"  {question:<38} {label:<42} {score['mae']:7.3f}", flush=True)
         if len(rows) < 2:
             continue
-        df = pd.DataFrame(rows).sort_values("inner MAE")
-        gap = df["inner MAE"].iloc[-1] - df["inner MAE"].iloc[0]
-        spread = df["fold std"].max()
-        out += [f"\n**{question}** (LightGBM)\n", _md(df, "{:.3f}"),
+        # Weather is ranked by fixed-cutoff CSI. MAE is shown beside it and is
+        # explicitly not the decision metric: ranking these variants on average
+        # error would pick by the number stage 1 already proved misleading.
+        #
+        # The spread has to be the fold std OF THE RANKED METRIC. A CSI gap
+        # cannot exceed 1.0, so measuring it against an MAE fold std of about 5
+        # puts "a real difference" out of reach whatever the data says.
+        df = pd.DataFrame(rows)
+        if rank == "csi":
+            df = df.sort_values("inner CSI", ascending=False)
+            measure, spread_col = "inner CSI", "CSI fold std"
+        else:
+            df = df.sort_values("inner MAE")
+            measure, spread_col = "inner MAE", "fold std"
+        gap = df[measure].max() - df[measure].min()
+        spread = df[spread_col].max()
+        out += [f"\n**{question}** ({candidate})\n", _md(df, "{:.3f}"),
+                ("\nRanked by inner CSI at the fixed alert threshold; MAE is shown but not ranked on."
+                 if rank == "csi" else "") +
                 f"\nBest: `{df['option'].iloc[0]}`. Spread {gap:.3f} vs fold std "
                 f"{spread:.3f} — " + ("a real difference." if gap > spread else
                  "**within the noise, so the simpler option wins.**")]
@@ -629,6 +668,20 @@ def main() -> int:
                     help="preprocessing ablations on the inner validation window")
     ap.add_argument("--only", action="append", choices=list(CANDIDATES),
                     help="run just these candidates (repeatable)")
+    # Weather is OFF by default, on the ablation of 2026-08-20 (--ablate).
+    # At 24h on inner validation, lightgbm-q90 scored CSI 0.135 with NO weather,
+    # 0.133 with the forecast columns and 0.130 adding the lid at issue time — a
+    # spread of 0.008 against a CSI fold std of 0.087, ten times inside the noise.
+    # The leaky ceiling variant, handed the true lid at the target hour, reached
+    # only 0.138, so even a perfect boundary-layer forecast buys about 0.003.
+    # Kept behind a flag rather than deleted: it is the first thing to re-measure
+    # if a finer-grained weather product ever becomes available.
+    ap.add_argument("--weather", action="store_true",
+                    help="add the archived-forecast weather columns at 24h/48h "
+                         "(the ablation does not support them — see the note above)")
+    ap.add_argument("--blh", choices=["none", "issue", "target"], default="none",
+                    help="boundary-layer-height variant; 'target' reads the "
+                         "answer key and exists only to price a ceiling")
     # Spatial features are OFF by default, on two independent measurements:
     #   1. EDA 2026-08-20 — median cross-station correlation is 0.23 within
     #      30 km and 0.24 beyond 150 km, and corr(distance, correlation) is
@@ -642,6 +695,10 @@ def main() -> int:
                     help="add neighbour and regional columns (the EDA does not "
                          "support them — see the note above this flag)")
     args = ap.parse_args()
+
+    if args.blh != "none" and not args.weather:
+        sys.exit(f"--blh {args.blh} attaches a boundary-layer column to the "
+                 "weather block, which --weather turns on. Pass both or neither.")
 
     if args.refresh:
         from baselines import pull
@@ -666,10 +723,11 @@ def main() -> int:
         # Before the other frames are built: ablations only ever touch the 24h
         # horizon, and building the other three would be a minute of nothing.
         print(f"ablations, seed {RANDOM_SEED}:", flush=True)
-        print("\n" + ablate(wide, coords))
+        print("\n" + ablate(wide, coords, weather=args.weather, blh=args.blh))
         return 0
 
-    frames = {h: features.build(wide, h, coords, spatial=coords is not None)
+    frames = {h: features.build(wide, h, coords, spatial=coords is not None,
+                                weather=args.weather, blh=args.blh)
               for h in HORIZONS}
 
     if args.folds:

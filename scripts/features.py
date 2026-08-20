@@ -51,9 +51,48 @@ ROLL_WINDOWS = (6, 24)
 # ablation questions.
 MIN_PRESENT = 0.5
 
+# Hours the label spans, starting at the target hour. 1 reproduces the stage 1
+# and stage 3 tables exactly; scripts/classify.py raises it, because the decision
+# a subscriber makes is about a stretch of the evening rather than one clock hour.
+TARGET_WINDOW = 1
+
 # Trend terms: value now minus value this many hours ago. 120 on the way up is a
 # different situation from 120 on the way down, and no single lag says which.
 TREND_SPANS = (3, 6)
+
+# Tail features, off by default. They are aimed at the spike, which is where
+# every failure so far has been, and they are gated so that the stage 1 and
+# stage 3 tables stay reproducible to the decimal without them.
+#
+# Extra own-history lags: the longest ordinary lag is 48h, so nothing sees
+# "the same hour last week".
+TAIL_LAGS = (72, 168)
+
+# A reading above this counts as an exceedance for the recency features. It is
+# CPCB's Very Poor band, the same number classify.py defaults to, because a
+# station that crossed the line twice yesterday is in a different regime.
+EXCEED_ABOVE = 121.0
+EXCEED_COUNT_WINDOWS = (24, 72)
+
+# Cap on hours-since-last-exceedance. Uncapped, a clean station reads as an
+# arbitrarily large number that swamps the split points; a week is long enough
+# to mean "not recently".
+SINCE_CAP = 168
+
+# Window for the per-station z-score. Station means differ a lot and the model
+# otherwise has to learn each one from station_id alone. A week is long enough
+# to carry a level and short enough to follow a seasonal shift.
+Z_WINDOW = 168
+
+# Diwali (Lakshmi Puja night) in IST. This is NCR: the largest predictable spike
+# of the year is a DATE, and it was not in the features until now.
+#
+# Only 2025-10-20 falls inside the history, so the model sees ONE instance and
+# no fold can validate it. It is here because the cost is a column and the
+# alternative is a model that provably cannot see the biggest event in the year,
+# but do not read a gain on this column as evidence at n=1.
+DIWALI = ("2024-11-01", "2025-10-20", "2026-11-08")
+DIWALI_WINDOW = 10   # days either side; beyond this the column saturates
 
 # Neighbouring stations to average. Pollution arrives from somewhere, and
 # neighbouring stations correlate — this is the flat-feature stand-in for the
@@ -62,6 +101,8 @@ K_NEIGHBOURS = 3
 NEIGHBOUR_LAG = 6
 
 STATIONS_CACHE = os.path.join(os.path.dirname(CACHE), "stations.csv")
+CELLS_CACHE = os.path.join(os.path.dirname(CACHE), "weather_cells.csv")
+WEATHER_CACHE = os.path.join(os.path.dirname(CACHE), "weather.csv")
 
 STATIONS_QUERY = """
 SELECT station_id, station_name, latitude, longitude
@@ -100,6 +141,13 @@ def load_coords(path: str = STATIONS_CACHE) -> dict[int, tuple[float, float]]:
                 for r in csv.DictReader(fh)}
 
 
+def load_cells(path: str = CELLS_CACHE) -> dict[int, tuple[float, float]]:
+    """Station IDs -> the Open-Meteo grid cell each station resolves to."""
+    with open(path, encoding="utf-8") as fh:
+        return {int(r["station_id"]): (float(r["cell_lat"]), float(r["cell_lon"]))
+                for r in csv.DictReader(fh)}
+
+
 # A reading of exactly 0.0 ug/m3 is a dead sensor, not clean air, and it is
 # treated as MISSING rather than dropped from the table.
 #
@@ -130,6 +178,18 @@ def to_hour(timestamps: pd.Series) -> pd.Series:
     one, so this stays correct if the parsed resolution changes again.
     """
     return (timestamps - EPOCH) // pd.Timedelta("1h")
+
+
+def load_weather(path: str = WEATHER_CACHE) -> dict[tuple[float, float], pd.DataFrame]:
+    """Open-Meteo cache -> one epoch-hour-indexed frame per forecast cell."""
+    raw = pd.read_csv(path)
+    raw["epoch_hour"] = to_hour(pd.to_datetime(raw["hour"], utc=True))
+    return {
+        (float(cell_lat), float(cell_lon)): group.drop(
+            columns=["cell_lat", "cell_lon", "hour"]
+        ).set_index("epoch_hour").sort_index()
+        for (cell_lat, cell_lon), group in raw.groupby(["cell_lat", "cell_lon"])
+    }
 
 
 def load_wide(path: str = CACHE) -> pd.DataFrame:
@@ -186,16 +246,77 @@ def _cyclical(values: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
     return np.sin(radians), np.cos(radians)
 
 
+def _tail_block(own: pd.Series, index: pd.Index) -> dict[str, pd.Series | np.ndarray]:
+    """Spike-shaped features. Every one is a backward window on this station.
+
+    `own` is already reindexed onto the complete hourly grid, so every shift and
+    every rolling window below is an exact number of HOURS, including across an
+    outage. Nothing here reads past its own row.
+    """
+    out: dict[str, object] = {}
+    for lag in TAIL_LAGS:
+        out[f"lag_{lag}"] = own.shift(lag)
+
+    for w in ROLL_WINDOWS:
+        # For a spike the recent MAXIMUM is the obvious signal and only the mean
+        # and std existed. min comes free from the same window and says whether
+        # the air ever cleared.
+        roll = own.rolling(w, min_periods=max(1, int(math.ceil(w * MIN_PRESENT))))
+        out[f"roll_max_{w}"] = roll.max()
+        out[f"roll_min_{w}"] = roll.min()
+
+    # A missing hour counts as "no exceedance" rather than as unknown. The
+    # alternative propagates NaN across every gap and empties the column on the
+    # stations that go dark for 10-19h at a time, which is most of them.
+    over = (own > EXCEED_ABOVE).astype(float)
+    for w in EXCEED_COUNT_WINDOWS:
+        out[f"exceed_count_{w}"] = over.rolling(w, min_periods=1).sum()
+
+    # Hours since the last exceedance, INCLUDING the current hour (0 when the
+    # air is over the line right now). ffill of "the hour this last happened" is
+    # backward-looking by construction; before the first exceedance it is NaN,
+    # which is the truth rather than a made-up large number.
+    hours = pd.Series(np.asarray(index, dtype=float), index=index)
+    last = hours.where(over > 0).ffill()
+    out["hours_since_exceed"] = (hours - last).clip(upper=SINCE_CAP)
+
+    # Per-station normalisation: how unusual is right now FOR THIS STATION.
+    win = own.rolling(Z_WINDOW, min_periods=int(Z_WINDOW * MIN_PRESENT))
+    mean, std = win.mean(), win.std()
+    out[f"z_{Z_WINDOW}"] = (own - mean) / std.where(std > 0)
+    return out
+
+
+def _diwali_days(index: pd.Index) -> np.ndarray:
+    """Signed days from the nearest Diwali, clipped to +/- DIWALI_WINDOW.
+
+    A calendar column, so it carries no information about the future beyond what
+    a wall calendar already carries. Negative is before, positive is after -
+    signed rather than absolute because the smoke lingers for days afterwards
+    and the run-up is not symmetric with it.
+    """
+    days = (pd.to_datetime(np.asarray(index) * 3600, unit="s", utc=True)
+            .tz_convert(IST).normalize().tz_localize(None))
+    offsets = np.stack([(days - pd.Timestamp(d)).days.to_numpy(dtype=float)
+                        for d in DIWALI])
+    nearest = offsets[np.abs(offsets).argmin(axis=0), np.arange(len(days))]
+    return np.clip(nearest, -DIWALI_WINDOW, DIWALI_WINDOW)
+
+
 def _station_block(wide: pd.DataFrame, station: int, horizon: int,
                    nbrs: dict[int, list[int]] | None,
                    spatial: bool, cyclical: bool,
-                   min_present: float) -> pd.DataFrame:
+                   min_present: float, tail: bool = False,
+                   weather: bool = False,
+                   blh: str = "none",
+                   weather_frame: pd.DataFrame | None = None,
+                   target_window: int = 1) -> pd.DataFrame:
     """One station's rows, indexed by ISSUE hour.
 
     Every column below is a backward shift or a trailing window, so no value in
-    a row can carry a timestamp later than that row's index. The one exception
-    is `_target`, which is the future by definition and is the only negative
-    shift in this file.
+    a row can carry a timestamp later than that row's index. Forecast values
+    are also allowed to carry target-hour timestamps because they were issued
+    before the issue hour; `_target` is future by definition.
     """
     own = wide[station]
     block = pd.DataFrame(index=wide.index)
@@ -215,6 +336,11 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
     for span in TREND_SPANS:
         block[f"trend_{span}"] = own - own.shift(span)
 
+    if tail:
+        for name, values in _tail_block(own, wide.index).items():
+            block[name] = values
+        block["diwali_days"] = _diwali_days(wide.index)
+
     if spatial and nbrs is not None:
         near = wide[nbrs[station]].mean(axis=1)
         block["nbr_mean"] = near
@@ -229,15 +355,54 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
             s, c = _cyclical(np.asarray(values, dtype=float), period)
             block[f"{name}_sin"], block[f"{name}_cos"] = s, c
 
+    if weather and horizon in (24, 48):
+        if weather_frame is None:
+            raise ValueError(f"no weather frame for station {station}")
+        lead = "previous_day1" if horizon == 24 else "previous_day2"
+        for name, column in (("wx_wind_speed", "wind_speed_10m"),
+                             ("wx_temp", "temperature_2m"),
+                             ("wx_rh", "relative_humidity_2m"),
+                             ("wx_precip", "precipitation")):
+            block[name] = weather_frame[f"{column}_{lead}"].shift(-horizon)
+        direction = weather_frame[f"wind_direction_10m_{lead}"].shift(-horizon)
+        sin, cos = _cyclical(direction.to_numpy(dtype=float), 360)
+        block["wx_wind_dir_sin"], block["wx_wind_dir_cos"] = sin, cos
+        if blh == "issue":
+            block["wx_blh_issue"] = weather_frame["boundary_layer_height"]
+            block["wx_blh_trend_24"] = (weather_frame["boundary_layer_height"]
+                                        - weather_frame["boundary_layer_height"].shift(24))
+        elif blh == "target":
+            # Deliberately reads the answer key; this exists to measure a ceiling and must never become the default.
+            block["wx_blh_target"] = weather_frame["boundary_layer_height"].shift(-horizon)
+
     block["station_id"] = station
-    block["_target"] = own.shift(-horizon)
+    point = own.shift(-horizon)
+    if target_window > 1:
+        # "Is this evening safe?" is a question about a stretch of hours, not
+        # about 19:00 exactly. Scoring a single hour marks a model that was right
+        # about 18:00 and wrong about 19:00 as a total miss, which is not the
+        # mistake the subscriber experienced.
+        #
+        # Admission still keys on the POINT target, so the admitted rows are
+        # identical to the target_window=1 case and the two tables compare. Only
+        # the label changes.
+        window = pd.concat([own.shift(-(horizon + i)) for i in range(target_window)],
+                           axis=1).max(axis=1)
+        block["_target"] = window.where(point.notna())
+    else:
+        block["_target"] = point
     return block
 
 
 def build(wide: pd.DataFrame, horizon: int,
           coords: dict[int, tuple[float, float]] | None = None,
           spatial: bool = True, cyclical: bool = True,
-          min_present: float = MIN_PRESENT) -> pd.DataFrame:
+          min_present: float = MIN_PRESENT, tail: bool = False,
+          weather: bool = False,
+          blh: str = "none", target_window: int = TARGET_WINDOW,
+          cells: dict[int, tuple[float, float]] | None = None,
+          weather_frames: dict[tuple[float, float], pd.DataFrame] | None = None
+          ) -> pd.DataFrame:
     """All stations stacked. One row = one forecast, indexed by issue hour.
 
     ROW ADMISSION: a row survives only when the target is present AND lag_0 is
@@ -250,6 +415,9 @@ def build(wide: pd.DataFrame, horizon: int,
     over whatever it happened to reach gave persistence 49,993 pairs against
     climatology's 7,534 — two error figures off two different sets of hours.
     """
+    if blh not in {"none", "issue", "target"}:
+        raise ValueError(f"blh must be one of none, issue, target; got {blh!r}")
+
     nbrs = neighbours(coords) if (spatial and coords) else None
     if spatial and nbrs is not None:
         # A station with history but no coordinates would silently lose its
@@ -260,7 +428,34 @@ def build(wide: pd.DataFrame, horizon: int,
             raise ValueError(f"no coordinates for station(s) {missing}; "
                              "re-run --pull-stations or pass spatial=False")
 
-    blocks = [_station_block(wide, s, horizon, nbrs, spatial, cyclical, min_present)
+    if not (weather and horizon in (24, 48)):
+        cells = weather_frames = None
+    else:
+        # Read from the cache unless a caller supplied frames. tests/test_features.py
+        # supplies its own: a leak gate that loads the real gitignored cache is not
+        # runnable on a fresh clone, and it cannot control what the forecast column
+        # holds, which is the one thing the weather cases have to assert.
+        if cells is None:
+            cells = load_cells()
+        if weather_frames is None:
+            weather_frames = load_weather()
+        # The completed hourly history index makes every shift an hourly lead,
+        # including across outages in either source.
+        weather_frames = {cell: frame.reindex(wide.index)
+                          for cell, frame in weather_frames.items()}
+        missing = [s for s in wide.columns if s not in cells]
+        if missing:
+            raise ValueError(f"no weather cell for station(s) {missing}; "
+                             "re-run scripts/weather.py --pull-cells")
+        missing_frames = [s for s in wide.columns if cells[s] not in weather_frames]
+        if missing_frames:
+            raise ValueError(f"no weather data for station(s) {missing_frames}; "
+                             "re-run scripts/weather.py --pull")
+
+    blocks = [_station_block(
+        wide, s, horizon, nbrs, spatial, cyclical, min_present, tail, weather, blh,
+        weather_frames[cells[s]] if weather_frames is not None else None,
+        target_window)
               for s in wide.columns]
     out = pd.concat(blocks)
     out.index.name = "issue_hour"
@@ -279,6 +474,18 @@ def main() -> int:
                     help="cache station coordinates from Neon (one wake)")
     ap.add_argument("--describe", action="store_true",
                     help="print the column list and per-horizon row counts")
+    # Off by default here for the same reason it is off in benchmark.py: the
+    # 2026-08-20 ablation put every weather variant inside the fold noise.
+    ap.add_argument("--weather", action="store_true",
+                    help="include the archived-forecast columns at 24h and 48h")
+    ap.add_argument("--blh", choices=["none", "issue", "target"], default="none",
+                    help="boundary-layer-height variant, with --weather")
+    # Off by default so the stage 1 and stage 3 tables stay reproducible; the
+    # ablation is what decides whether they earn a place, exactly as --spatial
+    # and --weather were decided.
+    ap.add_argument("--tail", action="store_true",
+                    help="include the spike-shaped columns (long lags, rolling "
+                         "max/min, exceedance recency, z-score, Diwali)")
     args = ap.parse_args()
 
     if args.pull_stations:
@@ -297,14 +504,16 @@ def main() -> int:
           f"({wide.notna().mean().mean():.1%} of slots present)\n")
 
     for h in HORIZONS:
-        frame = build(wide, h, coords, spatial=coords is not None)
+        frame = build(wide, h, coords, spatial=coords is not None,
+                      tail=args.tail, weather=args.weather, blh=args.blh)
         X, y = split_xy(frame)
-        if h == HORIZONS[0]:
-            print(f"{len(X.columns)} feature columns:")
-            print("  " + ", ".join(X.columns) + "\n")
+        wx_count = sum(column.startswith("wx_") for column in X.columns)
+        print(f"horizon {h:>2}h: {len(X.columns)} feature columns "
+              f"({wx_count} wx_ columns):")
+        print("  " + ", ".join(X.columns))
         severe = int((y > SEVERE_ABOVE).sum())
         print(f"horizon {h:>2}h: {len(X):>7,} rows, {severe:>5,} severe, "
-              f"{X.isna().mean().mean():.1%} of feature cells NaN")
+              f"{X.isna().mean().mean():.1%} of feature cells NaN\n")
     return 0
 
 

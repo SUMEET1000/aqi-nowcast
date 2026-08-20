@@ -36,9 +36,16 @@ def exceedance(pairs: list[tuple[float, float]], threshold: float) -> dict:
 
     pairs are (truth, prediction) in ug/m3; both sides are thresholded at the
     same cutoff, so this measures the point forecast rather than a separate
-    classifier. Training a dedicated classifier at a ~2% positive rate would
-    mean class weighting and resampling this project does not need — the
-    regression output already carries the information.
+    classifier.
+
+    This docstring used to add that a dedicated classifier "would mean class
+    weighting and resampling this project does not need — the regression output
+    already carries the information". That was written before anything was
+    measured and it was wrong: every regressor here reached the alert by
+    thresholding a conditional mean, which is what dragged recall to 0.13 while
+    MAE improved. scripts/classify.py predicts the exceedance directly instead.
+    The sentence is kept as a correction rather than deleted, because it is a
+    clean example of an assumption hardening into a fact by being written down.
 
     Returns the confusion counts alongside the rates, because a rate computed
     on four events is not a rate and the counts are the only way to see that.
@@ -52,7 +59,8 @@ def exceedance(pairs: list[tuple[float, float]], threshold: float) -> dict:
 
 
 def best_threshold(pairs: list[tuple[float, float]], event_above: float,
-                   grid: range | None = None) -> tuple[float, float]:
+                   grid=None, default: float | None = None,
+                   objective: str = "csi") -> tuple[float, float]:
     """The decision threshold on the PREDICTION that maximises CSI.
 
     The event is still "truth above event_above" — that is fixed by CPCB and is
@@ -70,10 +78,16 @@ def best_threshold(pairs: list[tuple[float, float]], event_above: float,
     """
     if not pairs:
         return event_above, float("nan")
-    grid = grid or range(5, int(event_above) + 1, 5)
-    best, best_csi = float(event_above), 0.0
+    # Any iterable of numbers. scripts/classify.py passes a 0-1 probability
+    # grid, where the concentration default below would mean "never warn".
+    grid = grid if grid is not None else range(5, int(event_above) + 1, 5)
+    best = float(event_above if default is None else default)
+    best_csi = 0.0
     for t in grid:
-        csi = exceedance_at(pairs, event_above, float(t))["csi"]
+        # Tuned on the metric the table is judged by. Leaving this hardwired to
+        # CSI while reporting F2 would optimise one quantity and grade another,
+        # which is the same error one level down as tuning on the test set.
+        csi = exceedance_at(pairs, event_above, float(t))[objective]
         if csi == csi and csi > best_csi:      # NaN never wins
             best, best_csi = float(t), csi
     # The floor is 0.0, not -1.0, and that is load-bearing. In a validation
@@ -98,12 +112,56 @@ def exceedance_at(pairs: list[tuple[float, float]], event_above: float,
             fp += 1
         else:
             tn += 1
+    n = tp + fp + fn + tn
+    # Hits a random forecaster would get by chance, given how often it warned and
+    # how often the event happened. CSI does not subtract these, so it flatters a
+    # forecaster on a common event: at a 13% base rate a coin-flipper scores well
+    # above zero. ETS is CSI with that term removed, and it is the reason
+    # meteorology reports ETS when comparing across events of different rarity.
+    chance = (tp + fn) * (tp + fp) / n if n else 0.0
     return {
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        "n": tp + fp + fn + tn, "events": tp + fn,
+        "n": n, "events": tp + fn,
         "precision": _ratio(tp, tp + fp), "recall": _ratio(tp, tp + fn),
         "f1": _ratio(2 * tp, 2 * tp + fp + fn), "csi": _ratio(tp, tp + fp + fn),
+        # F2 weights recall four times precision (beta squared). For a health
+        # alert a miss and a false alarm are not the same injury: one sends a
+        # child outside into bad air, the other keeps them in on a clean day.
+        # CSI's tp/(tp+fp+fn) weighs them 1:1, which is an answer to that
+        # question rather than a refusal to answer it — and the wrong one.
+        # Beta is 2 and not larger because alert fatigue is real (build plan §10):
+        # a bot that warns daily gets muted, and a muted bot has recall 0.
+        "f2": _ratio(5 * tp, 5 * tp + 4 * fn + fp),
+        "ets": ((tp - chance) / (tp + fp + fn - chance)
+                if (tp + fp + fn - chance) else float("nan")),
     }
+
+
+# Bands for the miss breakdown, in ug/m3. CPCB's Very Poor band runs 121-250 and
+# Severe starts at 250; the split at 150 separates "just over the line" from
+# "clearly bad" inside Very Poor.
+MISS_BANDS = ((121.0, 150.0), (150.0, 250.0), (250.0, float("inf")))
+
+
+def miss_severity(pairs: list[tuple[float, float]], warn_above: float,
+                  bands=MISS_BANDS) -> list[dict]:
+    """What the misses were worth, band by band.
+
+    A single recall number treats a missed 130 and a missed 400 identically, and
+    they are not the same event for the person reading the message. Measured
+    2026-08-20 on fold 1 at h=12, lightgbm-balanced missed 54.1% of 121-150 hours
+    against 28.2% of hours above 250 — the model was already prioritising
+    correctly and no scalar in the table could show it.
+    """
+    out = []
+    for lo, hi in bands:
+        events = [(t, p) for t, p in pairs if lo <= t < hi]
+        missed = sum(1 for _, p in events if p <= warn_above)
+        out.append({"band": f"{lo:.0f}-{hi:.0f}" if hi != float("inf")
+                    else f"{lo:.0f}+",
+                    "events": len(events), "missed": missed,
+                    "miss_rate": _ratio(missed, len(events))})
+    return out
 
 
 def residual_quantiles(pairs: list[tuple[float, float]],
