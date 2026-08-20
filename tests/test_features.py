@@ -438,7 +438,8 @@ except ValueError as exc:
 
 print("\n-- weather: a station with no grid cell is refused, not silently NaN --")
 try:
-    build(WIDE, 24, COORDS, cells={k: v for k, v in CELLS.items() if k != 4})
+    build(WIDE, 24, COORDS, weather=True,
+          cells={k: v for k, v in CELLS.items() if k != 4})
     check("missing cell raises", "no exception", "ValueError")
 except ValueError as exc:
     check("missing cell raises ValueError naming the station", "4" in str(exc), True)
