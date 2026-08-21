@@ -262,8 +262,41 @@ def fit_tuned(name: str, Xtr, ytr, both, yin, n_inner: int, threshold: float,
     return best
 
 
+# Epoch hour -> hour of the day in IST.
+#
+# THE +6 IS NOT A TYPO AND `tz_convert` IS THE WRONG TOOL HERE. Every stamp in
+# pm25_history sits at :30 past the UTC hour (192,666 of 192,666, checked
+# 2026-08-21) and features.to_hour FLOORS to the hour, so the index value for a
+# reading taken at 19:30 UTC is the epoch hour of 19:00 UTC. Converting that
+# floored value to IST gives 00:30, half an hour early and in the wrong hour
+# bucket half the time; the reading is really 19:30 UTC = 01:00 IST. So the
+# offset is +5:30 for the timezone plus the +0:30 the flooring removed.
+#
+# Consequence worth stating plainly: the 07:00 IST send is `hour % 24 == 1`,
+# which is 01:30 UTC — the same value send_alerts.yml's cron carries.
+IST_OFFSET_HOURS = 6
+SEND_HOUR_IST = 7
+
+# Where the per-station table is split for reporting. Station base rates span
+# 1.1% to 43.4% at 12h — a factor of 40 — so one averaged margin over all 30 is
+# an average of two different problems. 8% is roughly the middle of that spread
+# and is a reporting cut only: nothing is fitted, thresholded or excluded by it.
+RARE_EVENT_RATE = 0.08
+
+
+def ist_hour(epoch_hour):
+    return (epoch_hour + IST_OFFSET_HOURS) % 24
+
+
 def run(frames: dict, chosen: list[str], threshold: float,
-        draws: int = 0) -> pd.DataFrame:
+        draws: int = 0, detail: list | None = None) -> pd.DataFrame:
+    """Score every (candidate, horizon, fold).
+
+    `detail`, when a list is passed, also collects the per-row test predictions
+    that the aggregate is computed from — the input breakdown() needs to ask
+    which issue hours and which stations the average is hiding. Off unless
+    asked: it is roughly one row per scored forecast per candidate.
+    """
     rng = np.random.default_rng(RANDOM_SEED)
     rows = []
     for horizon in HORIZONS:
@@ -284,12 +317,158 @@ def run(frames: dict, chosen: list[str], threshold: float,
                 row.update(candidate=name, horizon=horizon, fold=fold_i,
                            inner_f2=inner, params=str(params))
                 rows.append(row)
+                if detail is not None:
+                    # `margin` is proba - warn, so a row is a warning exactly
+                    # when margin > 0 regardless of which fold tuned it. That is
+                    # what lets folds with different cutoffs be pooled into one
+                    # per-hour or per-station group without re-tuning anything —
+                    # and re-tuning per group would be fitting on test.
+                    detail.append(pd.DataFrame({
+                        "candidate": name, "horizon": horizon, "fold": fold_i,
+                        "issue_hour": Xte.index.to_numpy(),
+                        "station_id": Xte["station_id"].to_numpy(),
+                        "truth": yte.to_numpy(),
+                        "margin": proba[len(Xin):] - warn,
+                    }))
                 print(f"  h={horizon:>2} fold {fold_i}  {name:<18} "
                       f"p>{warn:.2f}  recall {row['recall']:.2f}  "
                       f"prec {row['precision']:.2f}  F2 {row['f2']:.3f}  "
                       f"CSI {row['csi']:.3f}  ETS {row['ets']:.3f}  "
                       f"AP {row['ap']:.3f}", flush=True)
     return pd.DataFrame(rows)
+
+
+def _f2_of(group: pd.DataFrame, threshold: float) -> dict:
+    """F2 and counts for one pooled group of rows.
+
+    Reuses metrics.exceedance_at rather than re-deriving F2 here, by passing the
+    margin as the prediction against a warning cutoff of 0.0 — the same
+    arithmetic tests/test_metrics.py already gates. A second copy of
+    5tp/(5tp+4fn+fp) in this file is a copy that goes stale.
+    """
+    return metrics.exceedance_at(
+        list(zip(group["truth"].tolist(), group["margin"].tolist())),
+        threshold, 0.0)
+
+
+def breakdown(detail: pd.DataFrame, summary: pd.DataFrame,
+              threshold: float) -> str:
+    """Split the averaged score by ISSUE HOUR and by STATION.
+
+    WHY THIS EXISTS, AND WHY IT GATES THE WINDOW PRODUCT. Every number this
+    project has published is a mean over 30 stations and 4 folds, and every
+    horizon pools all 24 issue hours equally. But the product issues at 07:00
+    IST and nowhere else, so a 12h result is a claim about the HORIZON, not
+    about the send. If the win is carried by issue hours the product never uses,
+    there is no win. Likewise a mean over 30 stations hides a station served
+    badly, whose subscribers get a worse-than-persistence forecast with no way
+    to tell.
+
+    Nothing is refitted. These are the same test predictions the headline table
+    is computed from, regrouped — so a difference here is a real property of the
+    model and not a second model.
+    """
+    detail = detail.assign(ist=ist_hour(detail["issue_hour"]))
+    out = []
+
+    # Which candidate to hold up against persistence, per horizon: whatever won
+    # the headline table, so this cannot quietly grade a different model.
+    best_at = {}
+    for h in HORIZONS:
+        at = summary[summary["horizon"] == h].set_index("candidate")
+        rivals = at.drop(index="persistence", errors="ignore")
+        if len(rivals):
+            best_at[h] = rivals[OBJECTIVE].idxmax()
+
+    rows = []
+    for h in HORIZONS:
+        if h not in best_at:
+            continue
+        for label, sel in (("all 24 issue hours", detail["horizon"] == h),
+                           (f"{SEND_HOUR_IST:02d}:00 IST only",
+                            (detail["horizon"] == h) &
+                            (detail["ist"] == SEND_HOUR_IST))):
+            block = detail[sel]
+            base = _f2_of(block[block["candidate"] == "persistence"], threshold)
+            model = _f2_of(block[block["candidate"] == best_at[h]], threshold)
+            rows.append({
+                "horizon": f"{h}h", "rows scored": label,
+                "n": model["n"], "events": model["events"],
+                "persistence F2": round(base["f2"], 3),
+                "best": best_at[h], "F2": round(model["f2"], 3),
+                "margin": round(model["f2"] - base["f2"], 3),
+                "recall": round(model["recall"], 3),
+            })
+
+    out.append("### By issue hour — does the win survive at the send time?\n")
+    out.append(_md(pd.DataFrame(rows), "{:.3f}"))
+    out.append(
+        "\n**Read the `n` column before the `margin` column.** The 07:00 rows "
+        "are 1/24 of the pooled rows by construction, so their event counts are "
+        "small and their margins are noisier than the headline table's. A "
+        "margin that shrinks here is not automatically a real effect; a margin "
+        "that REVERSES is worth chasing.\n")
+
+    # Per station, at the one horizon that clears the bar, over all issue hours.
+    # All hours and not 07:00 alone: splitting 30 ways and 24 ways at once
+    # leaves per-cell counts too small to say anything with.
+    h = 12 if 12 in best_at else next(iter(best_at), None)
+    if h is not None:
+        srows, silent = [], []
+        block = detail[detail["horizon"] == h]
+        for station_id, grp in block.groupby("station_id"):
+            base = _f2_of(grp[grp["candidate"] == "persistence"], threshold)
+            model = _f2_of(grp[grp["candidate"] == best_at[h]], threshold)
+            # No events means F2 is 0/0 for every candidate, so the row grades
+            # nothing and sorts to a misleading place. Station 12 is the real
+            # case: OpenAQ returns 408 for it on every attempt, so it has almost
+            # no history. Named below rather than silently dropped.
+            if model["events"] == 0:
+                silent.append(f"{int(station_id)} (n={model['n']:,})")
+                continue
+            srows.append({
+                # A string on purpose, and not only for looks: _md formats via
+                # df.iterrows(), which collapses an all-numeric row to float64
+                # and would print station 16 as "16.000". A row containing one
+                # string stays dtype=object and every value keeps its own type,
+                # which is why the other tables in this file are unaffected.
+                "station": str(int(station_id)), "n": model["n"],
+                "events": model["events"],
+                "event rate": round(model["events"] / model["n"], 3),
+                "persistence F2": round(base["f2"], 3),
+                "F2": round(model["f2"], 3),
+                "margin": round(model["f2"] - base["f2"], 3),
+            })
+        frame = pd.DataFrame(srows).sort_values("margin")
+        worse = frame[frame["margin"] < 0]
+        out.append(f"\n### By station, at {h}h, candidate `{best_at[h]}` "
+                   f"(all issue hours)\n")
+        out.append(_md(frame, "{:.3f}"))
+        out.append(
+            f"\n**{len(worse)} of {len(frame)} station(s) score BELOW "
+            f"persistence.** Those subscribers would be served a forecast worse "
+            f"than 'the same as now', and nothing in the product tells them so. "
+            f"The decision this table exists for is whether such a station is "
+            f"excluded from the alert or served persistence instead — it is a "
+            f"product decision, not a modelling one, and it is Sumeet's.")
+        if silent:
+            out.append(f"\nNot graded, no events in the test blocks: "
+                       f"{', '.join(silent)}.")
+
+        # Split by how often the event happens at all, because the headline
+        # margin is an average over stations whose base rates differ ~40x.
+        rate = frame["event rate"]
+        lo, hi = frame[rate < RARE_EVENT_RATE], frame[rate >= RARE_EVENT_RATE]
+        out.append(
+            f"\nSplit by how common the event is at that station "
+            f"(cut at {RARE_EVENT_RATE:.0%}):\n\n"
+            f"| stations | count | median margin | below persistence |\n"
+            f"|---|---|---|---|\n"
+            f"| event rate < {RARE_EVENT_RATE:.0%} | {len(lo)} | "
+            f"{lo['margin'].median():+.3f} | {int((lo['margin'] < 0).sum())} |\n"
+            f"| event rate >= {RARE_EVENT_RATE:.0%} | {len(hi)} | "
+            f"{hi['margin'].median():+.3f} | {int((hi['margin'] < 0).sum())} |\n")
+    return "\n".join(out)
 
 
 def summarise(results: pd.DataFrame) -> pd.DataFrame:
@@ -373,6 +552,30 @@ def self_test() -> int:
     cut, csi = metrics.best_threshold(pairs, 121.0, grid=PROBABILITY_GRID, default=0.5)
     print(f"  cutoff search   : chose p>{cut:.2f} at CSI {csi:.3f}")
     ok = ok and csi == 1.0
+
+    # The IST mapping the breakdown groups by. Checked against a stamp whose
+    # answer is known independently: send_alerts.yml's cron is 01:30 UTC and the
+    # send is 07:00 IST, so epoch hour 1 must map to 7. The naive route —
+    # tz_convert on the floored hour — answers 6, half an hour early, and would
+    # put the send in the wrong bucket silently.
+    known = features.EPOCH + pd.Timedelta(hours=1)
+    naive = known.tz_convert("Asia/Kolkata").hour
+    got = int(ist_hour(1))
+    print(f"  IST mapping     : epoch hour 1 -> {got:02d}:00 IST "
+          f"(naive tz_convert on the floored hour says {naive:02d}, which is "
+          f"the trap)")
+    ok = ok and got == SEND_HOUR_IST and naive != SEND_HOUR_IST
+
+    # Pooling folds with different cutoffs must not change the verdict. Two
+    # "folds", cutoffs 0.3 and 0.8, each perfectly separated: margin-shifted and
+    # pooled, F2 must still be 1.0.
+    pooled = pd.DataFrame({
+        "truth":  [50.0, 300.0, 60.0, 400.0],
+        "margin": [.1 - .3, .9 - .3, .2 - .8, .95 - .8],
+    })
+    f2 = _f2_of(pooled, 121.0)["f2"]
+    print(f"  pooled cutoffs  : F2 {f2:.3f} across two folds tuned differently")
+    ok = ok and f2 == 1.0
     print("SELF-TEST PASSED" if ok else "SELF-TEST FAILED — the scoring cannot "
           "tell a perfect classifier from a broken one", file=sys.stderr if not ok else sys.stdout)
     return 0 if ok else 1
@@ -398,6 +601,11 @@ def main() -> int:
                          f"horizon and fold, scored on inner validation "
                          f"(default {TUNE_DRAWS} when the flag is given, 0 = off). "
                          f"Applies to the tree candidates only.")
+    ap.add_argument("--breakdown", action="store_true",
+                    help="also split the same test predictions by IST issue "
+                         "hour and by station. Nothing is refitted — it asks "
+                         "what the average over 30 stations and 24 issue hours "
+                         "is hiding, which is a gate before any window product.")
     ap.add_argument("--only", action="append", choices=list(CANDIDATES))
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -421,7 +629,8 @@ def main() -> int:
           f"any of {args.window}h from the target, tuned on {OBJECTIVE.upper()}   "
           f"candidates: {', '.join(chosen)}\n")
 
-    results = run(frames, chosen, args.threshold, args.tune)
+    detail = [] if args.breakdown else None
+    results = run(frames, chosen, args.threshold, args.tune, detail)
     if results.empty:
         sys.exit("no folds produced rows")
 
@@ -429,6 +638,10 @@ def main() -> int:
     print("\n## Per-horizon summary (mean over folds)\n")
     print(_md(summary, "{:.3f}"))
     print("\n## Gate\n\n" + verdict(summary, args.threshold))
+    if detail:
+        print("\n## Breakdown — what the average hides\n")
+        print(breakdown(pd.concat(detail, ignore_index=True), summary,
+                        args.threshold))
     return 0
 
 
