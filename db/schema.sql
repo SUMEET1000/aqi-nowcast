@@ -330,3 +330,88 @@ CREATE TABLE IF NOT EXISTS pm25_history (
 
     PRIMARY KEY (station_id, observation_ts)
 );
+
+
+-- drift_log — Phase 5. One row per station per ISO week: the shape of the
+-- PM2.5 distribution that week.
+--
+-- Written by scripts/monitor.py. It exists for one reason: in October the
+-- stubble-burning season shifts the distribution hard and the model degrades,
+-- and a post-mortem needs a BEFORE to point at. That before cannot be collected
+-- in November. Build plan §8.
+--
+-- Why the PM2.5 distribution and not the 35 model features: every lag, roll and
+-- z-score in scripts/features.py is a trailing window over this one series, and
+-- weather is off by default (it did not help — see the stage 2 ablation). So
+-- this table is the source distribution, not a proxy for it. Per-feature stats
+-- would be strictly more data and, today, no more information.
+--
+-- Source is pm25_history (OpenAQ, real µg/m³) and NOT observations.value_avg,
+-- which is CPCB's AQI sub-index — a piecewise transform of concentration, so
+-- its distribution moves for reasons that are not air.
+--
+-- Exact 0.0 readings are excluded on write. 2.27% of pm25_history is exactly
+-- zero and those are dead sensors, not clean air (58% sit in runs longer than
+-- 24h; 81% begin in the hour after a reading above 20 µg/m³). Including them
+-- drags every mean toward a sensor fault. Same rule as features.DROP_EXACT_ZERO.
+CREATE TABLE IF NOT EXISTS drift_log (
+    -- Monday of the ISO week, UTC. date_trunc('week', ...) in a session pinned
+    -- to UTC, for the reason gate1_check.main() gives: IST is a half-hour
+    -- offset, so buckets computed on this laptop and on a runner land 30
+    -- minutes apart and the same data yields two different tables.
+    week_start      DATE        NOT NULL,
+    station_id      INTEGER     NOT NULL REFERENCES stations(station_id),
+
+    -- Readings behind the row. A partial week is written like any other and is
+    -- excluded at READ time by monitor.py, not here — deciding it on write
+    -- would mean the newest week never lands until it is over, and a re-run
+    -- mid-week would have nothing to update.
+    n               INTEGER     NOT NULL,
+
+    mean            DOUBLE PRECISION NOT NULL,
+    std             DOUBLE PRECISION NOT NULL,
+    p50             DOUBLE PRECISION NOT NULL,
+    p90             DOUBLE PRECISION NOT NULL,
+    p99             DOUBLE PRECISION NOT NULL,
+    max_value       DOUBLE PRECISION NOT NULL,
+
+    -- First seen, not last written, so a re-run is a true no-op in this column.
+    -- Same convention as observations.ingested_at.
+    snapshot_ts     TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (week_start, station_id)
+);
+
+
+-- station_health — Phase 5. Current liveness per station, overwritten each run.
+--
+-- Deliberately NOT part of drift_log. That table is history and is keyed by
+-- week; this is a single now-value, and a station dark for six days has no row
+-- in the current week to hang it on. One table each, both obvious.
+--
+-- Its whole job is `was_dark`: monitor.py alerts only when a station CHANGES
+-- state. Station 26 (Shastri Nagar, Narnaul) left the CPCB feed on 2026-08-20
+-- and has not returned, so an alert keyed on "is dark" rather than "just went
+-- dark" would fire every single run forever, which trains the reader to ignore
+-- it and then hides the real one. Same reasoning as the 3h staleness rule in
+-- send_alerts.compose.
+--
+-- Read from observations, not pm25_history: OpenAQ's archive runs ~19h behind
+-- real time (measured 2026-08-21), so every station would read as dark under a
+-- 12h rule. CPCB's feed is the current one. value_avg being a sub-index does
+-- not matter here — the question is whether the sensor reported anything at
+-- all, not what it said.
+CREATE TABLE IF NOT EXISTS station_health (
+    station_id      INTEGER     PRIMARY KEY REFERENCES stations(station_id),
+
+    -- Newest bulletin carrying a non-NULL PM2.5 value_avg. NULL means this
+    -- station has never reported one. A row is not a reading: ingest.py writes
+    -- a row per pollutant per bulletin, NULL where CPCB sent 'NA'.
+    last_seen       TIMESTAMPTZ,
+
+    -- The verdict at the previous run. Compared against the current one to
+    -- produce the alert, then overwritten.
+    was_dark        BOOLEAN     NOT NULL,
+
+    checked_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);

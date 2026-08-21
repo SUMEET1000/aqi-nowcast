@@ -1,0 +1,100 @@
+# Phase 5 monitoring. Once a week: snapshot the PM2.5 distribution, then check
+# it against the trailing 8 weeks and check which stations have gone quiet.
+#
+# It exists to be running BEFORE the stubble-burning season, not during it.
+# Build plan §8 wants a dated post-mortem of a real drift incident, and a
+# post-mortem needs a before to point at — one that cannot be collected in
+# November. scripts/monitor.py --backfill has already put the 2025 season in
+# drift_log, so this October has a real prior rather than a feeling.
+#
+# THE ALERT CHANNEL IS THIS JOB FAILING. monitor.py exits 1 when something
+# changed — a new drift crossing or a station that just went dark — and GitHub
+# emails on a failed run. No new secret, no Telegram token in a third place.
+# Both checks fire on CHANGE, never on state, so a six-week drift is one red
+# run and not six.
+name: monitor
+
+on:
+  # Tuesday 02:00 UTC. Weekly, not daily: drift_log is keyed by ISO week and
+  # monitor.py only scores COMPLETE weeks, so a second run inside the same week
+  # can reach no new conclusion.
+  #
+  # Tuesday rather than Monday because the week being scored only just ended and
+  # its data has to have arrived. pm25_history is OpenAQ's archive and runs
+  # behind real time — 20h, measured 2026-08-21 — so a Monday 02:00 run would
+  # score a week whose last hours had not landed yet. ~26h of margin, and the
+  # snapshot rewrites the trailing 10 weeks on every run, so anything that
+  # arrives later is still corrected.
+  #
+  # Backup only, exactly as in ingest.yml and send_alerts.yml: GitHub delivered
+  # 11 of ~36 requested ticks on this repo. The primary is the Cloudflare Worker
+  # in trigger/. Both firing is harmless — the snapshot is an upsert and the
+  # alert is keyed on a state change that the first run has already consumed.
+  schedule:
+    - cron: '0 2 * * 2'
+
+  workflow_dispatch:
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+# `contents: read` and not `{}`, for the reason ingest.yml gives: actions/checkout
+# authenticates its clone with GITHUB_TOKEN, so an empty map breaks checkout.
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    # No CPCB fetch and no Telegram call. Worst case is connect() at 3 x 15s
+    # plus one full-history snapshot, which took ~20s locally over 192k rows.
+    timeout-minutes: 10
+
+    steps:
+      # SHA-pinned, not tagged, for the reason ingest.yml gives: a major tag is
+      # a branch GitHub can move, and a moved tag gets code execution in this
+      # job just before DATABASE_URL enters it. To update, read the tag's SHA
+      # (gh api repos/actions/checkout/git/ref/tags/v5) and change the SHA and
+      # its trailing comment together.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      # requirements.txt, not requirements-model.txt. This job runs no model —
+      # it reads a table and compares numbers — so it needs psycopg and nothing
+      # else. Pulling ~300 MB of ML wheels here would be for code it never runs.
+      - name: Install frozen dependencies
+        run: pip install -r requirements.txt
+
+      # Same argument as the other two workflows: from outside the job a missing
+      # secret and an unreachable database look identical, and the Actions log
+      # download returns 403 without admin rights even on a public repo.
+      # Presence, length and shape only — never a value.
+      - name: Preflight — check the secret is present and well-formed
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL is empty. Add it under Settings -> Secrets and variables -> Actions -> Repository secrets."
+            exit 1
+          fi
+          echo "DATABASE_URL: present (${#DATABASE_URL} chars)"
+
+      # Proves the checks can still fail before their verdict is trusted. No
+      # database and no network, so it costs nothing and it is the reason a
+      # green run below is evidence. This repo has a scar: five separate checks
+      # could not fail and all five reported PASS.
+      - name: Self-test — can these checks fail?
+        run: python scripts/monitor.py --self-test
+
+      - name: Snapshot and check
+        env:
+          PYTHONUNBUFFERED: "1"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/monitor.py

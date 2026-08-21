@@ -17,9 +17,15 @@ const REPO = "aqi-nowcast";
 // survives that by running again; a once-a-day job does not — it is simply
 // missing on most mornings, and Gate 2 is measured in whether people keep
 // opening the message.
+//
+// The weekly monitor is here for a different reason from the other two. Its
+// tick is the rarest in the system — 52 a year — so GitHub's ~31% delivery rate
+// does not average out over it: a missed week is a week of the stubble season
+// with no drift verdict, and the season is about six weeks long.
 const WORKFLOWS = {
   "5,35 * * * *": "ingest.yml",
   "30 1 * * *": "send_alerts.yml", // 07:00 IST
+  "0 2 * * 2": "monitor.yml", // Tuesday, after the scored week's data lands
 };
 
 // The workflow-dispatch endpoint, deliberately, rather than

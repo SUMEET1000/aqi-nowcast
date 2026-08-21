@@ -17,7 +17,7 @@ SCHEMA = os.path.join(os.path.dirname(__file__), "..", "db", "schema.sql")
 # partial apply fails here rather than in the next scheduled ingest (§0.5).
 EXPECTED_TABLES = ("stations", "observations", "fetch_log",
                    "profiles", "subscribers", "sent_log", "feedback",
-                   "pm25_history")
+                   "pm25_history", "drift_log", "station_health")
 
 
 def main() -> int:
