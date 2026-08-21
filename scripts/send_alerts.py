@@ -293,10 +293,18 @@ def sample_rows(conn, station_id: int | None) -> list[tuple]:
     return rows
 
 
-def already_sent(conn, send_date) -> set[int]:
+def already_sent(conn, send_date) -> set[tuple[int, int]]:
+    """(chat_id, station_id) pairs sent today.
+
+    Keyed on the station, not the chat alone, so someone who changes station
+    with /stations gets the new station's reading now rather than nothing until
+    tomorrow. Mirrors sent_log's unique index; changing one without the other
+    turns the double-send guard into an integrity error.
+    """
     with conn.cursor() as cur:
-        cur.execute("SELECT chat_id FROM sent_log WHERE send_date = %s", (send_date,))
-        return {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT chat_id, station_id FROM sent_log WHERE send_date = %s",
+                    (send_date,))
+        return set(cur.fetchall())
 
 
 def main() -> int:
@@ -342,10 +350,10 @@ def main() -> int:
         by_conc = concentrations(conn, station_ids)
 
         for chat_id, station_id, station_name, profile_label in rows:
-            if chat_id in done:
-                # The UNIQUE (chat_id, send_date) index is the real guard; this
-                # is what stops a re-run costing a Telegram call per subscriber
-                # before hitting it.
+            if (chat_id, station_id) in done:
+                # The UNIQUE (chat_id, send_date, station_id) index is the real
+                # guard; this is what stops a re-run costing a Telegram call
+                # per subscriber before hitting it.
                 skipped += 1
                 continue
 

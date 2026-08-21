@@ -238,13 +238,25 @@ CREATE TABLE IF NOT EXISTS sent_log (
     observation_ts TIMESTAMPTZ,
     pm25_value     DOUBLE PRECISION,
     overall_aqi    INTEGER,
-    band           TEXT,
-
-    -- One message per subscriber per IST day. This is the constraint the
-    -- double-send guard rests on: the sender checks first, but a check plus a
-    -- unique index is the pair that survives two runs racing.
-    UNIQUE (chat_id, send_date)
+    band           TEXT
 );
+
+-- One message per subscriber PER STATION per IST day. Declared here rather
+-- than inline, because the key changed on 2026-08-21 (it was
+-- (chat_id, send_date)) and CREATE TABLE IF NOT EXISTS cannot migrate a table
+-- that already exists — the ALTER is what moves a live database.
+--
+-- Adding station_id is what lets /stations deliver the new station's reading
+-- straight away instead of going silent until tomorrow. Switching back to a
+-- station already sent today is a no-op, so the ceiling is one message per
+-- station per day, not one per tap.
+--
+-- station_id is nullable and Postgres allows multiple NULLs in a unique index,
+-- so a NULL would slip the guard. Nothing writes NULL: send_alerts.py takes it
+-- from the subscriber row, which has a NOT NULL foreign key.
+ALTER TABLE sent_log DROP CONSTRAINT IF EXISTS sent_log_chat_id_send_date_key;
+CREATE UNIQUE INDEX IF NOT EXISTS sent_log_chat_send_date_station_key
+    ON sent_log (chat_id, send_date, station_id);
 
 
 -- feedback — the 👍/👎 tap under each message.
@@ -286,8 +298,8 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 
 -- The sender's one hot query: "has this subscriber already had today's
--- message?" The UNIQUE (chat_id, send_date) above already provides the index,
--- so nothing further is added here. The station picker's liveness query reads
+-- message for this station?" sent_log_chat_send_date_station_key above already
+-- provides the index, so nothing further is added here. The station picker's liveness query reads
 -- observations at the newest bulletin, which the observations PRIMARY KEY
 -- serves.
 
