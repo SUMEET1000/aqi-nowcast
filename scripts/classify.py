@@ -288,14 +288,87 @@ def ist_hour(epoch_hour):
     return (epoch_hour + IST_OFFSET_HOURS) % 24
 
 
+ROUTED = "routed"
+
+# A station needs at least this many events in the inner window before its own
+# inner score is allowed to choose its candidate. Below it the choice is noise
+# dressed as a decision, and the fallback is persistence — the incumbent, and
+# the thing every station can always answer with.
+#
+# 10 is a floor, not a tuned value, and it is deliberately crude: at 5 events one
+# hit either way swings F2 enough to flip the pick.
+MIN_INNER_EVENTS = 10
+
+
+def route(fold_margins: dict, station_in, yin, station_te, threshold: float
+          ) -> tuple[np.ndarray, dict]:
+    """Per station, pick the candidate that scored best ON INNER VALIDATION.
+
+    THE WHOLE POINT IS *WHERE* THE CHOICE IS MADE. The per-station breakdown
+    showed 8 of 29 stations served worse than persistence at 12h — but that
+    table is computed on TEST, so routing by it would be choosing the answer
+    after seeing the exam. It is the same defect as fitting a scaler on all the
+    data, one level up, and this project has already been caught by it twice.
+    So the table says the problem is real; inner validation says which stations.
+
+    Returns the test margins after routing, and {station_id: candidate}.
+
+    A margin is `proba - warn`, so 0.0 is every candidate's warning cutoff and
+    margins from different models can be substituted row for row. Their
+    magnitudes are NOT comparable, which is why the caller must not compute an
+    AP over a routed vector.
+    """
+    picks: dict = {}
+    for station in np.unique(station_te):
+        seen = station_in == station
+        events = int((yin[seen] > threshold).sum())
+        if events < MIN_INNER_EVENTS:
+            picks[int(station)] = "persistence"
+            continue
+        truth = yin[seen].tolist()
+
+        def inner_f2(name: str) -> float:
+            return metrics.exceedance_at(
+                list(zip(truth,
+                         fold_margins[name][:len(station_in)][seen].tolist())),
+                threshold, 0.0)["f2"]
+
+        # The incumbent's score is the bar, and it is seeded here rather than at
+        # -1.0 so that a tie KEEPS persistence. Ranking every candidate together
+        # from -1.0 instead lets dict insertion order decide a tie, which is a
+        # silent coin-flip that happened to favour whichever model was listed
+        # first — caught by the tie case in self_test().
+        best, best_f2 = "persistence", inner_f2("persistence")
+        for name in fold_margins:
+            if name == "persistence":
+                continue
+            f2 = inner_f2(name)
+            # Strict >. A tie is no evidence to leave the incumbent, and a model
+            # that merely matches persistence is not worth the failure surface.
+            if f2 > best_f2:
+                best, best_f2 = name, f2
+        picks[int(station)] = best
+
+    n_in = len(station_in)
+    out = np.empty(len(station_te), dtype=float)
+    for name in set(picks.values()):
+        rows = np.array([picks[int(s)] == name for s in station_te])
+        out[rows] = fold_margins[name][n_in:][rows]
+    return out, picks
+
+
 def run(frames: dict, chosen: list[str], threshold: float,
-        draws: int = 0, detail: list | None = None) -> pd.DataFrame:
+        draws: int = 0, detail: list | None = None,
+        routing: bool = False, picks_log: list | None = None) -> pd.DataFrame:
     """Score every (candidate, horizon, fold).
 
     `detail`, when a list is passed, also collects the per-row test predictions
     that the aggregate is computed from — the input breakdown() needs to ask
     which issue hours and which stations the average is hiding. Off unless
     asked: it is roughly one row per scored forecast per candidate.
+
+    `routing` adds one more pseudo-candidate, `routed`, which serves each
+    station whichever real candidate won on ITS inner window. See route().
     """
     rng = np.random.default_rng(RANDOM_SEED)
     rows = []
@@ -310,9 +383,11 @@ def run(frames: dict, chosen: list[str], threshold: float,
             Xin, yin = X[inner], y[inner]
             Xte, yte = X[test], y[test]
             both = pd.concat([Xin, Xte])
+            fold_margins: dict = {}
             for name in chosen:
                 proba, warn, inner, params = fit_tuned(
                     name, Xtr, ytr, both, yin, len(Xin), threshold, draws, rng)
+                fold_margins[name] = proba - warn
                 row = score(yte.to_numpy(), proba[len(Xin):], threshold, warn)
                 row.update(candidate=name, horizon=horizon, fold=fold_i,
                            inner_f2=inner, params=str(params))
@@ -335,6 +410,40 @@ def run(frames: dict, chosen: list[str], threshold: float,
                       f"prec {row['precision']:.2f}  F2 {row['f2']:.3f}  "
                       f"CSI {row['csi']:.3f}  ETS {row['ets']:.3f}  "
                       f"AP {row['ap']:.3f}", flush=True)
+
+            if routing and len(fold_margins) > 1:
+                station_in = Xin["station_id"].to_numpy()
+                station_te = Xte["station_id"].to_numpy()
+                margins, picks = route(fold_margins, station_in,
+                                       yin.to_numpy(), station_te, threshold)
+                row = score(yte.to_numpy(), margins, threshold, 0.0)
+                # AP is deleted, not computed. It ranks a single score column,
+                # and a routed vector splices margins from different models
+                # whose magnitudes mean different things — the ordering across
+                # stations is meaningless even though each station's slice is
+                # fine. A number here would be quietly wrong, which is worse
+                # than a blank.
+                row["ap"] = float("nan")
+                row.update(candidate=ROUTED, horizon=horizon, fold=fold_i,
+                           inner_f2=float("nan"), params="")
+                rows.append(row)
+                if picks_log is not None:
+                    picks_log.append({"horizon": horizon, "fold": fold_i,
+                                      "picks": picks})
+                if detail is not None:
+                    detail.append(pd.DataFrame({
+                        "candidate": ROUTED, "horizon": horizon, "fold": fold_i,
+                        "issue_hour": Xte.index.to_numpy(),
+                        "station_id": station_te,
+                        "truth": yte.to_numpy(), "margin": margins,
+                    }))
+                n_pers = sum(1 for v in picks.values() if v == "persistence")
+                print(f"  h={horizon:>2} fold {fold_i}  {ROUTED:<18} "
+                      f"           recall {row['recall']:.2f}  "
+                      f"prec {row['precision']:.2f}  F2 {row['f2']:.3f}  "
+                      f"CSI {row['csi']:.3f}  ETS {row['ets']:.3f}  "
+                      f"  {n_pers}/{len(picks)} stations -> persistence",
+                      flush=True)
     return pd.DataFrame(rows)
 
 
@@ -426,6 +535,19 @@ def breakdown(detail: pd.DataFrame, summary: pd.DataFrame,
             if model["events"] == 0:
                 silent.append(f"{int(station_id)} (n={model['n']:,})")
                 continue
+            # PER FOLD, NOT JUST POOLED. A station whose margin is negative in
+            # one fold of four and positive in three has not been "served
+            # badly"; the pooled sign is one noisy draw and reading it as a
+            # property of the station is how a fold artefact becomes a fact.
+            # Only a station negative in every fold is making a claim.
+            per_fold = []
+            for _, fold_grp in grp.groupby("fold"):
+                b = _f2_of(fold_grp[fold_grp["candidate"] == "persistence"],
+                           threshold)
+                m = _f2_of(fold_grp[fold_grp["candidate"] == best_at[h]],
+                           threshold)
+                if m["events"]:
+                    per_fold.append(m["f2"] - b["f2"])
             srows.append({
                 # A string on purpose, and not only for looks: _md formats via
                 # df.iterrows(), which collapses an all-numeric row to float64
@@ -438,19 +560,24 @@ def breakdown(detail: pd.DataFrame, summary: pd.DataFrame,
                 "persistence F2": round(base["f2"], 3),
                 "F2": round(model["f2"], 3),
                 "margin": round(model["f2"] - base["f2"], 3),
+                "folds negative": f"{sum(1 for v in per_fold if v < 0)}"
+                                  f"/{len(per_fold)}",
             })
         frame = pd.DataFrame(srows).sort_values("margin")
         worse = frame[frame["margin"] < 0]
         out.append(f"\n### By station, at {h}h, candidate `{best_at[h]}` "
                    f"(all issue hours)\n")
         out.append(_md(frame, "{:.3f}"))
+        every = frame[frame["folds negative"].str.split("/").map(
+            lambda p: p[0] == p[1] and p[1] != "0")]
         out.append(
-            f"\n**{len(worse)} of {len(frame)} station(s) score BELOW "
-            f"persistence.** Those subscribers would be served a forecast worse "
-            f"than 'the same as now', and nothing in the product tells them so. "
-            f"The decision this table exists for is whether such a station is "
-            f"excluded from the alert or served persistence instead — it is a "
-            f"product decision, not a modelling one, and it is Sumeet's.")
+            f"\n**{len(worse)} of {len(frame)} station(s) score below "
+            f"persistence on the pooled test rows — but only {len(every)} "
+            f"do so in EVERY fold.** Read the `folds negative` column before "
+            f"the `margin` column. A station negative in 2 of 4 folds has a "
+            f"pooled sign decided by one noisy draw, and treating that as 'this "
+            f"station is served badly' turns a fold artefact into a fact about "
+            f"a place. Only an every-fold station is making a claim.")
         if silent:
             out.append(f"\nNot graded, no events in the test blocks: "
                        f"{', '.join(silent)}.")
@@ -469,6 +596,41 @@ def breakdown(detail: pd.DataFrame, summary: pd.DataFrame,
             f"| event rate >= {RARE_EVENT_RATE:.0%} | {len(hi)} | "
             f"{hi['margin'].median():+.3f} | {int((hi['margin'] < 0).sum())} |\n")
     return "\n".join(out)
+
+
+def routing_report(picks_log: list) -> str:
+    """Which stations the router sent to persistence, and how consistently.
+
+    The consistency column is the honest part. A station that picks persistence
+    in 4 folds of 4 is a stable property of that station; one that picks it in
+    2 of 4 is the router coin-flipping, and its per-station result should not be
+    read as a finding. With only four folds this is a small sample by
+    construction and cannot be fixed by reporting it differently.
+    """
+    per_horizon: dict = {}
+    for entry in picks_log:
+        for station, name in entry["picks"].items():
+            key = (entry["horizon"], station)
+            per_horizon.setdefault(key, []).append(name)
+
+    rows = []
+    for horizon in HORIZONS:
+        keys = [k for k in per_horizon if k[0] == horizon]
+        if not keys:
+            continue
+        folds = max(len(per_horizon[k]) for k in keys)
+        always = [k[1] for k in keys
+                  if all(v == "persistence" for v in per_horizon[k])]
+        ever = [k[1] for k in keys
+                if any(v == "persistence" for v in per_horizon[k])]
+        rows.append({
+            "horizon": f"{horizon}h", "stations": len(keys), "folds": folds,
+            "persistence in every fold": len(always),
+            "persistence in some fold": len(ever),
+            "always-persistence station ids":
+                ", ".join(str(s) for s in sorted(always)) or "-",
+        })
+    return _md(pd.DataFrame(rows), "{:.3f}")
 
 
 def summarise(results: pd.DataFrame) -> pd.DataFrame:
@@ -576,6 +738,43 @@ def self_test() -> int:
     f2 = _f2_of(pooled, 121.0)["f2"]
     print(f"  pooled cutoffs  : F2 {f2:.3f} across two folds tuned differently")
     ok = ok and f2 == 1.0
+
+    # The router. Two stations, opposite winners on inner: station 1 is served
+    # best by "model", station 2 by "persistence". A router that works must send
+    # each to a different candidate, so a bug that always picks one name cannot
+    # pass. Both have >= MIN_INNER_EVENTS so neither is decided by the fallback.
+    ev = MIN_INNER_EVENTS
+    station_in = np.array([1] * (2 * ev) + [2] * (2 * ev))
+    yin_t = np.array(([300.0] * ev + [50.0] * ev) * 2)
+    # model: right on station 1, wrong on station 2. persistence: the reverse.
+    model_in = np.array(([1.0] * ev + [-1.0] * ev) + ([-1.0] * ev + [1.0] * ev))
+    pers_in = -model_in
+    station_te = np.array([1, 2])
+    margins = {"model": np.concatenate([model_in, [1.0, 1.0]]),
+               "persistence": np.concatenate([pers_in, [-1.0, -1.0]])}
+    routed, picks = route(margins, station_in, yin_t, station_te, 121.0)
+    print(f"  router          : station 1 -> {picks[1]}, station 2 -> {picks[2]}")
+    ok = ok and picks == {1: "model", 2: "persistence"}
+    # ...and it must actually SUBSTITUTE the chosen margins, not just record it.
+    ok = ok and routed.tolist() == [1.0, -1.0]
+
+    # A station with too few inner events must fall back, not gamble.
+    thin_in = np.array([9] * 4)
+    routed2, picks2 = route(margins | {"model": np.array([1.0] * 4 + [1.0]),
+                                       "persistence": np.array([-1.0] * 4 + [-1.0])},
+                            thin_in, np.array([300.0, 50.0, 50.0, 50.0]),
+                            np.array([9]), 121.0)
+    print(f"  thin station    : 1 inner event -> {picks2[9]} "
+          f"(floor is {MIN_INNER_EVENTS})")
+    ok = ok and picks2 == {9: "persistence"}
+
+    # A tie must NOT move off the incumbent.
+    tie = {"model": np.array([1.0] * (2 * ev) + [1.0]),
+           "persistence": np.array([1.0] * (2 * ev) + [-1.0])}
+    _, picks3 = route(tie, np.array([1] * (2 * ev)),
+                      np.array([300.0] * ev + [50.0] * ev), np.array([1]), 121.0)
+    print(f"  tie             : -> {picks3[1]} (incumbent keeps it)")
+    ok = ok and picks3 == {1: "persistence"}
     print("SELF-TEST PASSED" if ok else "SELF-TEST FAILED — the scoring cannot "
           "tell a perfect classifier from a broken one", file=sys.stderr if not ok else sys.stdout)
     return 0 if ok else 1
@@ -601,6 +800,14 @@ def main() -> int:
                          f"horizon and fold, scored on inner validation "
                          f"(default {TUNE_DRAWS} when the flag is given, 0 = off). "
                          f"Applies to the tree candidates only.")
+    ap.add_argument("--route", action="store_true",
+                    help="add the `routed` candidate: serve each station "
+                         "whichever candidate won on ITS OWN inner validation "
+                         "window, falling back to persistence below "
+                         f"{MIN_INNER_EVENTS} inner events. This is the answer "
+                         "to '8 of 29 stations are served worse than "
+                         "persistence' — and it is decided on inner, never on "
+                         "the test table that found them.")
     ap.add_argument("--breakdown", action="store_true",
                     help="also split the same test predictions by IST issue "
                          "hour and by station. Nothing is refitted — it asks "
@@ -630,7 +837,9 @@ def main() -> int:
           f"candidates: {', '.join(chosen)}\n")
 
     detail = [] if args.breakdown else None
-    results = run(frames, chosen, args.threshold, args.tune, detail)
+    picks_log = [] if args.route else None
+    results = run(frames, chosen, args.threshold, args.tune, detail,
+                  args.route, picks_log)
     if results.empty:
         sys.exit("no folds produced rows")
 
@@ -638,6 +847,9 @@ def main() -> int:
     print("\n## Per-horizon summary (mean over folds)\n")
     print(_md(summary, "{:.3f}"))
     print("\n## Gate\n\n" + verdict(summary, args.threshold))
+    if picks_log:
+        print("\n## Routing — which stations were served persistence\n")
+        print(routing_report(picks_log))
     if detail:
         print("\n## Breakdown — what the average hides\n")
         print(breakdown(pd.concat(detail, ignore_index=True), summary,
