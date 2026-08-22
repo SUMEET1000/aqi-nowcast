@@ -22,26 +22,37 @@ from db import connect
 # guidance, and the same rule applies to a number as to a sentence. Phase 4
 # revisits them against real subscriber taps.
 #
-# The descriptions say who the profile is for, in build plan §1's own words.
+# The descriptions say who the profile is for, in plain words a person with no
+# technical or medical background reads once and understands.
+#
+# The Hindi pair is stored beside the English rather than translated in code,
+# so a fourth profile is still one INSERT here. Both readers COALESCE, so a row
+# added without Hindi falls back to English instead of showing nothing.
 PROFILES = [
     (
         "asthma_child",
         "Child with asthma",
-        "For a parent deciding about school and outdoor play.",
+        "A parent deciding about school or playing outside.",
+        "दमे वाला बच्चा",
+        "स्कूल या बाहर खेलने का फ़ैसला करने वाले माता-पिता के लिए।",
         61.0,
         24,
     ),
     (
         "copd_elderly",
-        "Older adult with COPD",
-        "For deciding about a morning walk.",
+        "Older person with breathing trouble",
+        "Deciding about a morning walk.",
+        "साँस की तकलीफ़ वाले बुज़ुर्ग",
+        "सुबह की सैर का फ़ैसला करने के लिए।",
         61.0,
         24,
     ),
     (
         "outdoor_worker",
-        "Outdoor worker",
-        "For deciding about shift timing and masking.",
+        "Works outdoors",
+        "Deciding when to work and when to wear a mask.",
+        "बाहर काम करने वाले",
+        "काम का समय और मास्क पहनने का फ़ैसला करने के लिए।",
         91.0,
         24,
     ),
@@ -54,11 +65,14 @@ def main() -> int:
             cur.executemany(
                 """
                 INSERT INTO profiles
-                    (profile_id, label, description, threshold_pm25, cooldown_hours)
-                VALUES (%s, %s, %s, %s, %s)
+                    (profile_id, label, description, label_hi, description_hi,
+                     threshold_pm25, cooldown_hours)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (profile_id) DO UPDATE SET
                     label          = EXCLUDED.label,
                     description    = EXCLUDED.description,
+                    label_hi       = EXCLUDED.label_hi,
+                    description_hi = EXCLUDED.description_hi,
                     threshold_pm25 = EXCLUDED.threshold_pm25,
                     cooldown_hours = EXCLUDED.cooldown_hours
                 """,

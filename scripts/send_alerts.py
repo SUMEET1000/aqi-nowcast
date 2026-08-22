@@ -30,6 +30,7 @@ ingest.py: one person's dead chat must not cost everyone else their message.
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from typing import NamedTuple
@@ -64,7 +65,142 @@ class Message(NamedTuple):
     band: str | None
 
 
-def feedback_keyboard(sent_log_id: int) -> dict:
+LANGS = ("en", "hi")
+
+
+def lang_of(code: str | None) -> str:
+    """Any unknown or NULL language falls back to English rather than raising.
+
+    A subscriber row written before the lang column existed carries the default
+    'en'; this guards the other direction, a code arriving from somewhere the
+    two-value set was not enforced. Never a KeyError inside the send loop — one
+    odd row must not cost everyone else their message.
+    """
+    return code if code in LANGS else "en"
+
+
+# CPCB's six band names, said in words a person with no technical or medical
+# background reads once and understands. These translate the BAND, never the
+# health sentence: every aqi.ADVISORY string stays CPCB's own, quoted and
+# cited, because build plan §5 forbids writing our own medical guidance and a
+# paraphrase of a health statement is our own guidance.
+#
+# An ADJECTIVE, not a sentence, and that is load-bearing. The message shows two
+# bands — one for this hour's dust, one for the government's 24-hour score —
+# and they legitimately disagree most of the time. Rendered as sentences the
+# reader met "Air is clean" and "Air is not good" three lines apart and had to
+# decide which one was the bug. As an adjective each lands on the number it
+# belongs to. TEXT["dust_band"] wraps it into the one sentence there is room
+# for, so both Hindi and English keep their own word order.
+BAND_PLAIN = {
+    "en": {
+        "Good":         ("🟢", "clean"),
+        "Satisfactory": ("🟡", "mostly OK"),
+        "Moderate":     ("🟠", "not good"),
+        "Poor":         ("🔴", "bad"),
+        "Very Poor":    ("🟣", "very bad"),
+        "Severe":       ("⚫", "dangerous"),
+    },
+    "hi": {
+        "Good":         ("🟢", "साफ़"),
+        "Satisfactory": ("🟡", "ठीक-ठाक"),
+        "Moderate":     ("🟠", "अच्छी नहीं"),
+        "Poor":         ("🔴", "खराब"),
+        "Very Poor":    ("🟣", "बहुत खराब"),
+        "Severe":       ("⚫", "खतरनाक"),
+    },
+}
+
+# The pollution board's own name, which is on the end of every station string
+# CPCB publishes. It tells a person choosing where they live nothing at all, so
+# it never reaches them. The stored station_name keeps it, byte for byte —
+# CPCB and OpenAQ join on that exact string, whitespace damage included.
+BOARD_SUFFIX = re.compile(r"\s*-\s*(HSPCB|IITM)\s*$")
+
+# The pollutant codes CPCB publishes, each with a plain gloss. The code is kept
+# beside the gloss rather than replaced by it: "PM10" is what every other app
+# on the same phone shows, so dropping it would make the two disagree.
+POLLUTANT_PLAIN = {
+    "en": {"PM2.5": "fine dust", "PM10": "bigger dust", "NO2": "vehicle fumes",
+           "SO2": "factory gas", "NH3": "ammonia", "OZONE": "ozone",
+           "CO": "carbon monoxide"},
+    "hi": {"PM2.5": "बारीक धूल", "PM10": "मोटी धूल",
+           "NO2": "गाड़ियों का धुआँ", "SO2": "फैक्ट्री की गैस",
+           "NH3": "अमोनिया", "OZONE": "ओज़ोन",
+           "CO": "कार्बन मोनोऑक्साइड"},
+}
+
+# Every sentence of the daily message except CPCB's quoted health statement.
+#
+# Written for someone who does not know what a sub-index, a concentration or a
+# bulletin is. Four technical strings survive, all four on purpose: "PM2.5",
+# "PM10", "AQI" and "µg/m³". The reader meets every one of them on the other
+# air apps on the same phone, so replacing them with invented plain words made
+# our numbers look like a DIFFERENT quantity instead of the same one said
+# simply. "Air score" was such an invention and it was the worse mistake:
+# CPCB already named this number, and a private synonym for a public name is
+# not simpler. Simplify the sentence around a term, not the term itself.
+TEXT = {
+    "en": {
+        "checked":   "Air checked at {t}",
+        "dust_band": "Air is {band} right now",
+        "dust":      "Fine dust in the air (PM2.5): <b>{v} µg/m³</b>",
+        "dust_note": "Under 30 counts as clean air.",
+        "warn":      ("⚠️ <b>Air is likely to get very bad around {t}.</b>\n"
+                      "Try to finish outdoor work before then."),
+        "score":     "Government AQI (last 24 hours): <b>{aqi} out of 500</b> — {band}",  # noqa: E501
+        "worst":     "Worst thing in the air: {code} ({plain})",
+        "advice":    "<b>Government health note:</b>",
+        "pm_only":   ("Only fine dust was measured this hour, so there is no "
+                      "full government AQI. The real AQI may be higher."),
+        "no_score":  ("The government has not put out an AQI for this place "
+                      "today. Only the dust number above is available."),
+        "age":       "This reading is {h} hours old.",
+        "stale":     ("⚠️ No newer reading since {t}. This one is {h} hours "
+                      "old."),
+        "for":       "For: {p}",
+        "rate":      "Was this useful today?",
+        "dark":      ("There is no reading right now. The government sensor "
+                      "here has stopped sending data. This usually lasts a few "
+                      "hours and fixes itself.\n\n"
+                      "You are still subscribed. Send /stations to pick "
+                      "another place."),
+    },
+    "hi": {
+        "checked":   "हवा देखी गई: {t}",
+        "dust_band": "अभी हवा {band} है",
+        "dust":      "हवा में बारीक धूल (PM2.5): <b>{v} µg/m³</b>",
+        "dust_note": "30 से कम मतलब साफ़ हवा।",
+        "warn":      ("⚠️ <b>{t} के आसपास हवा बहुत खराब हो सकती है।</b>\n"
+                      "बाहर का काम उससे पहले निपटा लें।"),
+        "score":     "सरकारी AQI (पिछले 24 घंटे): <b>500 में से {aqi}</b> — {band}",  # noqa: E501
+        "worst":     "हवा में सबसे खराब चीज़: {code} ({plain})",
+        "advice":    ("<b>सरकार की सेहत सलाह — जैसी अंग्रेज़ी में छपी है, "
+                      "वैसी ही:</b>"),
+        "pm_only":   ("इस घंटे सिर्फ़ बारीक धूल नापी गई, इसलिए पूरा सरकारी "
+                      "AQI नहीं है। असली AQI इससे ज़्यादा हो सकता है।"),
+        "no_score":  ("सरकार ने आज इस जगह का AQI नहीं दिया है। सिर्फ़ ऊपर "
+                      "वाला धूल का नंबर है।"),
+        "age":       "यह रीडिंग {h} घंटे पुरानी है।",
+        "stale":     ("⚠️ {t} के बाद नई रीडिंग नहीं आई। यह {h} घंटे पुरानी "
+                      "है।"),
+        "for":       "किसके लिए: {p}",
+        "rate":      "क्या यह आज काम आया?",
+        "dark":      ("अभी कोई रीडिंग नहीं है। इस जगह की सरकारी मशीन फ़िलहाल "
+                      "डेटा नहीं भेज रही। यह आम बात है और कुछ घंटों में ठीक "
+                      "हो जाता है।\n\n"
+                      "आपका सब्सक्रिप्शन चालू है। दूसरी जगह चुनने के लिए "
+                      "/stations भेजें।"),
+    },
+}
+
+FEEDBACK_BUTTONS = {
+    "en": ("👍 Useful", "👎 Not useful"),
+    "hi": ("👍 काम आया", "👎 काम नहीं आया"),
+}
+
+
+def feedback_keyboard(sent_log_id: int, lang: str = "en") -> dict:
     """The one tappable question per alert (build plan §5).
 
     Behavioural data instead of social data: friends say "cool" when asked
@@ -75,9 +211,10 @@ def feedback_keyboard(sent_log_id: int) -> dict:
     station and the number that were rated without the tap having to re-derive
     them. Telegram caps callback_data at 64 bytes; "fb:<bigint>:-1" is ~22.
     """
+    yes, no = FEEDBACK_BUTTONS[lang_of(lang)]
     return {"inline_keyboard": [[
-        {"text": "👍 Useful", "callback_data": f"fb:{sent_log_id}:1"},
-        {"text": "👎 Not useful", "callback_data": f"fb:{sent_log_id}:-1"},
+        {"text": yes, "callback_data": f"fb:{sent_log_id}:1"},
+        {"text": no, "callback_data": f"fb:{sent_log_id}:-1"},
     ]]}
 
 
@@ -86,12 +223,28 @@ def compose(station_name: str, readings: dict[str, float | None],
             profile_label: str,
             pm25_ugm3: float | None = None,
             concentration_ts: datetime | None = None,
-            warn_target: datetime | None = None) -> Message:
+            warn_target: datetime | None = None,
+            lang: str = "en") -> Message:
     """The whole message, as a pure function. See tests/test_message.py.
 
     Pure for the same reason ingest.build_rows is: this is the text a real
     person reads about their own health, and it must be checkable without a
     Neon wake or a Telegram send.
+
+    Written for a reader with no technical background. Every word naming a
+    mechanism rather than a fact is gone — "bulletin", "sub-index", "overall
+    AQI", "µg/m³", "the station is dark", "degraded". What is left is the
+    number, what it means in ordinary words, and who said so.
+
+    ONE THING IS NEVER SIMPLIFIED AND NEVER TRANSLATED: aqi.ADVISORY. Those are
+    CPCB's own health statements, quoted and cited, and the quote is the
+    liability shield (build plan §5, "we do not write our own medical
+    guidance"). A plain-language paraphrase of a health statement IS our own
+    guidance, and so is a translation of one. So on the Hindi path the sentence
+    stays in CPCB's English and the label above it says exactly that. Shipping
+    it in Hindi needs CPCB's own Hindi wording, cited to the document; nobody
+    has captured that, so it is not here. `[assumed: CPCB publishes a Hindi
+    bulletin; capturing it page-cited would test this]`
 
     Two numbers, from two sources, and they are NOT the same quantity:
 
@@ -104,6 +257,14 @@ def compose(station_name: str, readings: dict[str, float | None],
     the headline printed a sub-index labelled "µg/m³": Ambala read "51 µg/m³"
     for a true 30, and a station at AQI 157 was reported Very Poor when CPCB
     calls it Moderate. The message must never call a value_avg a concentration.
+
+    The two numbers cover different windows and read as a contradiction
+    whenever they disagree, which is most of the time — a 24-hour index lags
+    an hourly reading by design. That used to be handled by a sentence under
+    the table explaining it. The sentence is gone: it talked down to the
+    reader, and a paragraph explaining a table is a paragraph nobody reads.
+    Each window is stated ON the line it belongs to instead — the dust hour in
+    the header, "(last 24 hours)" inside the AQI label.
 
     OpenAQ is also the fresher of the two at send time. CPCB's feed freezes each
     morning — last bulletin 05:00 IST, next between 10:00 and 13:00 — while
@@ -141,16 +302,14 @@ def compose(station_name: str, readings: dict[str, float | None],
     Phase 4, where threshold_pm25 decides whether a message is sent at all.
     """
     esc = telegram_api.escape
+    lang = lang_of(lang)
+    t = TEXT[lang]
+    plain = BAND_PLAIN[lang]
     pm25 = readings.get("PM2.5")
+    head = f"📍 <b>{esc(BOARD_SUFFIX.sub('', station_name).strip())}</b>"
 
     if (observation_ts is None or pm25 is None) and pm25_ugm3 is None:
-        return Message(
-            f"<b>{esc(station_name)}</b>\n\n"
-            "This station is not reporting PM2.5 right now, so there is no "
-            "reading to send. Your subscription is fine — CPCB's sensor at "
-            "this station is dark, which usually lasts a few hours.\n\n"
-            "Use /stations to switch to another station.",
-            None, None)
+        return Message(f"{head}\n\n{t['dark']}", None, None)
 
     # %I is zero-padded ("05:00 AM"); Windows has no %-I, so strip by hand.
     def ist(ts: datetime) -> str:
@@ -163,51 +322,42 @@ def compose(station_name: str, readings: dict[str, float | None],
     age_h = (now - headline_ts).total_seconds() / 3600
     reading_time = ist(headline_ts)
 
-    lines = [f"<b>{esc(station_name)} — {reading_time} IST</b>", ""]
+    lines = [head, t["checked"].format(t=reading_time), ""]
 
     if pm25_ugm3 is not None:
-        lines += [f"PM2.5: <b>{pm25_ugm3:.0f} µg/m³</b> — "
-                  f"{aqi.pm25_band(pm25_ugm3)}", ""]
+        icon, word = plain[aqi.pm25_band(pm25_ugm3)]
+        lines += [f"{icon} <b>{t['dust_band'].format(band=word)}</b>",
+                  t["dust"].format(v=f"{pm25_ugm3:.0f}"),
+                  t["dust_note"], ""]
 
     if warn_target is not None:
-        lines += [f"⚠️ <b>Air is likely to be Very Poor around "
-                  f"{ist(warn_target)} IST.</b>",
-                  "Plan outdoor time before then.", ""]
+        lines += [t["warn"].format(t=ist(warn_target)), ""]
 
     overall, refusal = aqi.overall_aqi(readings)
     if overall is not None:
         lines += [
-            f"CPCB AQI {overall.aqi} ({overall.band}), worst pollutant "
-            f"{overall.dominant}",
+            t["score"].format(aqi=overall.aqi, band=plain[overall.band][1]),
+            t["worst"].format(
+                code=overall.dominant,
+                plain=POLLUTANT_PLAIN[lang].get(overall.dominant,
+                                                overall.dominant)),
+            "",
+            t["advice"],
             f"“{aqi.ADVISORY[overall.band]}”",
             f"— {aqi.ADVISORY_CITATION}",
         ]
     elif pm25 is not None:
         # Our own wording, and deliberately so: it describes what our number is
         # and is not, which is not something CPCB has published a sentence for.
-        lines += [
-            f"This is PM2.5 only — {aqi.band_of_index(int(round(pm25)))} for "
-            "PM2.5. Other pollutants are not included, so the official AQI may "
-            "be higher.",
-            f"({refusal})",
-        ]
+        lines += [t["pm_only"], f"({refusal})"]
     else:
-        lines += ["CPCB has published no AQI for this station yet today, so "
-                  "only the measured PM2.5 above is available."]
+        lines += [t["no_score"]]
 
-    # The two numbers cover different windows and would otherwise look like a
-    # contradiction whenever they disagree — which is most of the time, since a
-    # 24-hour index lags an hourly reading by design.
-    if pm25_ugm3 is not None and overall is not None:
-        lines += ["", "PM2.5 is this hour's measurement; the AQI is CPCB's "
-                      "24-hour index."]
-
-    lines += ["", f"Reading from {reading_time} IST, {age_h:.1f}h old."]
-    if age_h > STALE_AFTER_H:
-        lines.append(
-            f"⚠ CPCB has not published a newer bulletin since {reading_time} "
-            f"IST. This reading is {age_h:.1f} hours old.")
-    lines.append(f"Profile: {esc(profile_label)}")
+    lines += ["", t["stale"].format(t=reading_time, h=f"{age_h:.1f}")
+                  if age_h > STALE_AFTER_H
+                  else t["age"].format(h=f"{age_h:.1f}"),
+              t["for"].format(p=esc(profile_label)),
+              "", t["rate"]]
 
     return Message("\n".join(lines),
                    overall.aqi if overall else None,
@@ -325,9 +475,18 @@ def concentrations(conn, station_ids: list[int]
 
 
 def subscribers(conn, only: int | None) -> list[tuple]:
-    """(chat_id, station_id, station_name, profile_label), unpaused only."""
+    """(chat_id, station_id, station_name, profile_label, lang), unpaused only.
+
+    The profile label is picked in SQL rather than by a branch here, and it
+    COALESCEs: a profile added tomorrow without a Hindi label shows its English
+    one instead of an empty button. Build plan section 1's promise is that a
+    fourth profile is one INSERT, and a NOT NULL label_hi would have broken it.
+    """
     sql = """
-        SELECT s.chat_id, s.station_id, st.station_name, p.label
+        SELECT s.chat_id, s.station_id, st.station_name,
+               CASE WHEN s.lang = 'hi' THEN COALESCE(p.label_hi, p.label)
+                    ELSE p.label END,
+               s.lang
         FROM subscribers s
         JOIN stations st ON st.station_id = s.station_id
         JOIN profiles p ON p.profile_id = s.profile_id
@@ -343,13 +502,13 @@ def subscribers(conn, only: int | None) -> list[tuple]:
         return cur.fetchall()
 
 
-def sample_rows(conn, station_id: int | None) -> list[tuple]:
+def sample_rows(conn, station_id: int | None, lang: str) -> list[tuple]:
     """Fake subscribers for --dry-run, so the message can be read before anyone
     is subscribed to receive it. chat_id 0 never reaches Telegram — --dry-run
     is the only caller."""
-    sql = ("SELECT 0, station_id, station_name, 'Child with asthma' "
+    sql = ("SELECT 0, station_id, station_name, %s, %s "
            "FROM stations WHERE is_active")
-    params: list = []
+    params: list = [{"en": "Child with asthma", "hi": "दमे वाला बच्चा"}[lang], lang]
     if station_id is not None:
         sql += " AND station_id = %s"
         params.append(station_id)
@@ -384,6 +543,8 @@ def main() -> int:
                     help="with --dry-run, render for this station only")
     ap.add_argument("--only", type=int, metavar="CHAT_ID",
                     help="send to one subscriber (used before inviting testers)")
+    ap.add_argument("--lang", choices=LANGS, default="en",
+                    help="with --dry-run, render in this language")
     ap.add_argument("--no-forecast", action="store_true",
                     help="send the reading only, as this script did before the "
                          "model was wired in")
@@ -412,7 +573,7 @@ def main() -> int:
             print("observations is empty — nothing to send", file=sys.stderr)
             return 1
 
-        rows = (sample_rows(conn, args.station) if args.dry_run
+        rows = (sample_rows(conn, args.station, args.lang) if args.dry_run
                 else subscribers(conn, args.only))
         if not rows:
             print("no subscribers to send to" if not args.dry_run
@@ -423,7 +584,7 @@ def main() -> int:
         by_station = readings_at(conn, bulletin_ts, station_ids)
         by_conc = concentrations(conn, station_ids)
 
-        for chat_id, station_id, station_name, profile_label in rows:
+        for chat_id, station_id, station_name, profile_label, lang in rows:
             if (chat_id, station_id) in done:
                 # The UNIQUE (chat_id, send_date, station_id) index is the real
                 # guard; this is what stops a re-run costing a Telegram call
@@ -436,7 +597,8 @@ def main() -> int:
                               bulletin_ts, now, profile_label,
                               pm25_ugm3=conc[1] if conc else None,
                               concentration_ts=conc[0] if conc else None,
-                              warn_target=warn_at.get(station_id))
+                              warn_target=warn_at.get(station_id),
+                              lang=lang)
 
             if args.dry_run:
                 print(f"\n--- chat {chat_id} | station {station_id} "
@@ -472,7 +634,7 @@ def main() -> int:
                     sent_log_id = cur.fetchone()[0]
 
                 telegram_api.send_message(token, chat_id, message.text,
-                                          feedback_keyboard(sent_log_id))
+                                          feedback_keyboard(sent_log_id, lang))
                 conn.commit()
                 sent += 1
 

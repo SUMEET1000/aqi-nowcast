@@ -179,6 +179,13 @@ CREATE TABLE IF NOT EXISTS profiles (
     cooldown_hours  INTEGER          NOT NULL
 );
 
+-- Hindi label and description. NULLABLE, and every reader uses
+-- COALESCE(label_hi, label), so build plan §1's promise still holds: a fourth
+-- profile is one INSERT, and it works in both languages from the day it lands
+-- even if nobody has translated it yet.
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS label_hi       TEXT;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS description_hi TEXT;
+
 
 -- subscribers — chat ID, station, profile. Nothing else, ever.
 --
@@ -201,6 +208,17 @@ CREATE TABLE IF NOT EXISTS subscribers (
     -- outright — a person asking to be removed is removed, not flagged.
     is_paused    BOOLEAN     NOT NULL DEFAULT FALSE
 );
+
+-- Language of every message this person receives: 'en' or 'hi'.
+--
+-- ADD COLUMN rather than a column inside the CREATE TABLE above, because that
+-- table already holds live subscribers and CREATE TABLE IF NOT EXISTS does not
+-- alter an existing one. Same rule as sent_log's station_id.
+--
+-- Not personal data under build plan §5's rule: it is a display setting the
+-- person chose, exactly like their station, and it says nothing about them.
+ALTER TABLE subscribers
+    ADD COLUMN IF NOT EXISTS lang TEXT NOT NULL DEFAULT 'en';
 
 
 -- station_changes — one row per station switch, for rate limiting.

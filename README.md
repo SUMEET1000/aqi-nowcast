@@ -66,7 +66,8 @@ GitHub Actions ─▶ scripts/send_alerts.py ─▶ Telegram ─▶ one message 
                   for the overall AQI band                     │
                                                                ▼
 Telegram ──webhook──▶ Cloudflare Worker (bot/) ────────▶ Neon: subscribers, feedback
-   /start, station, profile          takes taps, writes rows — no arithmetic
+  /start, language, station,        takes taps, writes rows — no arithmetic
+  profile, feedback
                                               │
                                               │  service binding (internal, no public URL)
                                               ▼
@@ -569,9 +570,11 @@ tuned cutoff is the only part of the model's output with a measurement behind it
 - **A second test asserts no fold trains on a label from its own test block.** That is a
   different leak: a row's features can be impeccably backward-looking while its *label* sits
   inside the test window.
-- **Gaps are never filled.** 97% of missing hours sit in runs longer than 3 hours, past the
-  point where a forward-fill is an estimate rather than fabrication.
-- **4,379 readings of exactly 0.0 µg/m³ (2.27%) are masked as missing.** 58% of those hours sit
+- **Gaps are never filled.** Measured inside each station's own reporting span — the hours
+  before a station was installed are not an outage — 91% of missing hours sit in runs longer
+  than 3 hours, past the point where a forward-fill is an estimate rather than fabrication.
+  The 72% of gap *runs* that are 3h or shorter are worth only 9% of the lost hours.
+- **4,379 readings of exactly 0.0 µg/m³ (2.3%) are masked as missing.** 58% of those hours sit
   in runs longer than a day and 81% of runs begin in the hour after a reading above 20 µg/m³ —
   a sensor dropping out, not clean air. The existing range check could not see them, because
   0.0 is inside the valid range.
@@ -820,9 +823,14 @@ Stated here rather than discovered by a reader.
 
 ## Privacy
 
-The bot stores only a Telegram chat ID, a chosen station, and a chosen profile. **No
-coordinates, no names, no health records** — under DPDP, the less held the less owed. Health
+The bot stores only a Telegram chat ID, a chosen station, a chosen profile, and a chosen
+language. **No coordinates, no names, no health records** — under DPDP, the less held the less owed. Health
 advisory text is quoted from CPCB's published bands; no medical guidance is written here.
+
+The bot speaks English and Hindi. Everything around the health sentence is translated; the
+health sentence itself is **not**, and stays in CPCB's published English with its page
+citation, labelled as a quotation. Translating a health statement would make it ours, which
+is the same rule that forbids paraphrasing it.
 
 Committed files name **stations, never people**. Tester identities live only in a gitignored
 file.
