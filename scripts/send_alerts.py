@@ -43,7 +43,14 @@ from ingest import annotate, clean_detail, step_summary
 
 # Build plan §5: "if now - last_update_api > 3 hours, the message says so
 # explicitly. Never silently present a stale reading as current."
-STALE_AFTER_H = 3.0
+#
+# 12h, not §5's 3h, because the headline is OpenAQ's µg/m³ and OpenAQ publishes
+# late: 0 of 30 stations were inside 3h at a live check, newest 4.9h
+# [measured 2026-08-22]. At 3h the warning fired for every subscriber every
+# morning, which trains people to ignore the warning that matters. Same 12h and
+# same reason as monitor.MAX_DARK_HOURS; the "age" line still states the age
+# every day, so nothing is hidden.
+STALE_AFTER_H = 12.0
 
 # fetch_log outcomes owned by this script. Deliberately outside
 # gate1_check.RUN_OUTCOMES and ANOMALY_OUTCOMES, which are explicit whitelists —
@@ -111,6 +118,22 @@ BAND_PLAIN = {
     },
 }
 
+# A six-square scale printed under the AQI number: one square per CPCB band,
+# filled up to the band the reading lands in and painted that band's own colour.
+# Length carries the value, colour carries the severity, so the two cannot
+# disagree and neither needs a word of its own. Emoji rather than a <code>
+# block bar because <code> renders monospace but black and white, and the
+# colour is the whole point. It is NOT a sentence about the air — only the dust
+# line is, and tests/test_message.py holds that line.
+BAR_EMPTY = "⚪"
+
+
+def band_bar(band: str, plain: dict[str, tuple[str, str]]) -> str:
+    names = [name for _lo, _hi, name in aqi.BANDS]
+    filled = names.index(band) + 1
+    return plain[band][0] * filled + BAR_EMPTY * (len(names) - filled)
+
+
 # The pollution board's own name, which is on the end of every station string
 # CPCB publishes. It tells a person choosing where they live nothing at all, so
 # it never reaches them. The stored station_name keeps it, byte for byte —
@@ -155,9 +178,10 @@ TEXT = {
                       "full government AQI. The real AQI may be higher."),
         "no_score":  ("The government has not put out an AQI for this place "
                       "today. Only the dust number above is available."),
-        "age":       "This reading is {h} hours old.",
-        "stale":     ("⚠️ No newer reading since {t}. This one is {h} hours "
-                      "old."),
+        "age":       ("This reading is {h} hours old. Readings always reach "
+                      "us a few hours late — this is normal."),
+        "stale":     ("⚠️ Nothing new since {t} — {h} hours ago. That is much "
+                      "later than usual. The sensor here may have stopped."),
         "for":       "For: {p}",
         "rate":      "Was this useful today?",
         "dark":      ("There is no reading right now. The government sensor "
@@ -181,9 +205,10 @@ TEXT = {
                       "AQI नहीं है। असली AQI इससे ज़्यादा हो सकता है।"),
         "no_score":  ("सरकार ने आज इस जगह का AQI नहीं दिया है। सिर्फ़ ऊपर "
                       "वाला धूल का नंबर है।"),
-        "age":       "यह रीडिंग {h} घंटे पुरानी है।",
-        "stale":     ("⚠️ {t} के बाद नई रीडिंग नहीं आई। यह {h} घंटे पुरानी "
-                      "है।"),
+        "age":       ("यह रीडिंग {h} घंटे पुरानी है। रीडिंग हमेशा कुछ घंटे "
+                      "देर से पहुँचती है — यह आम बात है।"),
+        "stale":     ("⚠️ {t} के बाद कुछ नया नहीं आया — {h} घंटे पहले। यह आम से "
+                      "काफ़ी ज़्यादा देर है। यहाँ की मशीन बंद हो सकती है।"),
         "for":       "किसके लिए: {p}",
         "rate":      "क्या यह आज काम आया?",
         "dark":      ("अभी कोई रीडिंग नहीं है। इस जगह की सरकारी मशीन फ़िलहाल "
@@ -337,6 +362,7 @@ def compose(station_name: str, readings: dict[str, float | None],
     if overall is not None:
         lines += [
             t["score"].format(aqi=overall.aqi, band=plain[overall.band][1]),
+            band_bar(overall.band, plain),
             t["worst"].format(
                 code=overall.dominant,
                 plain=POLLUTANT_PLAIN[lang].get(overall.dominant,

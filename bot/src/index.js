@@ -297,9 +297,10 @@ async function stationList(sql) {
 // broken; five of thirty stations flickered during Phase 1, four of which came
 // back on their own.
 //
-// Two buttons per row, because thirty in one column is a scroll a person gives
-// up on. Rows stay in city order, so the two halves of a city land side by
-// side rather than a screen apart.
+// One button per row. Two columns fitted more names on a screen and Telegram
+// truncated the longer half of them with an ellipsis, so a person picking a
+// place could not read which place it was. A full-width button is the only
+// thing that guarantees the whole name, and a scroll beats a guess.
 function stationKeyboard(stations, lang) {
   const buttons = stations.map((s) =>
     s.live
@@ -312,9 +313,7 @@ function stationKeyboard(stations, lang) {
           callback_data: `${CB_DARK}:${s.station_id}`,
         },
   );
-  const rows = [];
-  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-  return { inline_keyboard: rows };
+  return { inline_keyboard: buttons.map((b) => [b]) };
 }
 
 // Read from the table, never hardcoded. Build plan §1: adding a fourth profile

@@ -83,7 +83,11 @@ ADVISORY = {
     "Severe":       "Affects healthy people and seriously impacts those with existing diseases",
 }
 
-ADVISORY_CITATION = "CPCB Daily AQI Bulletin, p.13"
+# The board's name is spelled out: "CPCB" alone means nothing to a reader who
+# has not met it, and this line is the only place in the message it appears.
+# The document's own name is untouched, which is what keeps the quote citable.
+ADVISORY_CITATION = ("Central Pollution Control Board (CPCB), "
+                    "Daily AQI Bulletin, p.13")
 
 # CPCB's Source A, the canonical scheme document: Table 3.12 "Health Statements
 # for AQI Categories", printed page 36 of the National Air Quality Index report

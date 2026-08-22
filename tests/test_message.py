@@ -102,9 +102,12 @@ check("but the place itself survives", "Sector-51, Gurugram" in m.text, True)
 # Two bands are shown and they legitimately disagree. Rendered as two full
 # sentences the reader met "Air is clean" above "Air is not good" and had to
 # guess which was the bug. Only ONE line may be a sentence about the air.
+# The AQI bar also starts with a band square and is exempt by carrying no
+# space: it is a scale, not a claim.
 check("only the dust line is phrased as a sentence about the air",
       sum(1 for ln in m.text.split("\n")
-          if ln.startswith(("🟢", "🟡", "🟠", "🔴", "🟣", "⚫"))), 1)
+          if ln.startswith(("🟢", "🟡", "🟠", "🔴", "🟣", "⚫"))
+          and " " in ln), 1)
 check("the score line carries a bare adjective, not a rival sentence",
       "500</b> — bad" in m.text, True)
 print()
@@ -193,20 +196,23 @@ print()
 
 print(f"Staleness is user-facing from day one (build plan §5, >{STALE_AFTER_H}h):")
 readings = {"PM2.5": 72.0, "PM10": 140.0, "NO2": 30.0}
-check("at 2.0h — the 07:00 IST send — there is no warning",
-      "No newer reading" in compose("S", readings, OBS, at(2.0), PROFILE).text,
-      False)
-check("at 3.0h — the 08:00 IST limit — still none",
-      "No newer reading" in compose("S", readings, OBS, at(3.0), PROFILE).text,
-      False)
-check("at 4.0h — 09:00 IST — the warning fires",
-      "No newer reading" in compose("S", readings, OBS, at(4.0), PROFILE).text,
-      True)
+# The boundary is read from the constant, never typed twice, so raising the
+# threshold to quiet a daily warning cannot also quiet this check.
+under, over = STALE_AFTER_H - 1.0, STALE_AFTER_H + 1.0
+ALARM = "Nothing new since"
+check(f"at {under}h — OpenAQ's ordinary publishing lag — no alarm",
+      ALARM in compose("S", readings, OBS, at(under), PROFILE).text, False)
+check(f"at {over}h — later than OpenAQ ever runs — the alarm fires",
+      ALARM in compose("S", readings, OBS, at(over), PROFILE).text, True)
 check("and the age is stated, not just flagged",
-      "4.0 hours" in compose("S", readings, OBS, at(4.0), PROFILE).text, True)
-check("the age is always stated, warning or not",
-      "2.0 hours old" in compose("S", readings, OBS, at(2.0), PROFILE).text,
+      f"{over:.1f} hours" in compose("S", readings, OBS, at(over), PROFILE).text,
       True)
+check("the age is always stated, alarm or not",
+      f"{under:.1f} hours old" in compose("S", readings, OBS, at(under),
+                                          PROFILE).text, True)
+check("and the quiet line says why a reading is hours old",
+      "reach us a few hours late" in compose("S", readings, OBS, at(under),
+                                             PROFILE).text, True)
 print()
 
 print("A station name is third-party text and goes through HTML escaping:")
