@@ -102,12 +102,9 @@ check("but the place itself survives", "Sector-51, Gurugram" in m.text, True)
 # Two bands are shown and they legitimately disagree. Rendered as two full
 # sentences the reader met "Air is clean" above "Air is not good" and had to
 # guess which was the bug. Only ONE line may be a sentence about the air.
-# The AQI bar also starts with a band square and is exempt by carrying no
-# space: it is a scale, not a claim.
 check("only the dust line is phrased as a sentence about the air",
       sum(1 for ln in m.text.split("\n")
-          if ln.startswith(("🟢", "🟡", "🟠", "🔴", "🟣", "⚫"))
-          and " " in ln), 1)
+          if ln.startswith(("🟢", "🟡", "🟠", "🔴", "🟣", "⚫"))), 1)
 check("the score line carries a bare adjective, not a rival sentence",
       "500</b> — bad" in m.text, True)
 print()

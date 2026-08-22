@@ -118,22 +118,6 @@ BAND_PLAIN = {
     },
 }
 
-# A six-square scale printed under the AQI number: one square per CPCB band,
-# filled up to the band the reading lands in and painted that band's own colour.
-# Length carries the value, colour carries the severity, so the two cannot
-# disagree and neither needs a word of its own. Emoji rather than a <code>
-# block bar because <code> renders monospace but black and white, and the
-# colour is the whole point. It is NOT a sentence about the air — only the dust
-# line is, and tests/test_message.py holds that line.
-BAR_EMPTY = "⚪"
-
-
-def band_bar(band: str, plain: dict[str, tuple[str, str]]) -> str:
-    names = [name for _lo, _hi, name in aqi.BANDS]
-    filled = names.index(band) + 1
-    return plain[band][0] * filled + BAR_EMPTY * (len(names) - filled)
-
-
 # The pollution board's own name, which is on the end of every station string
 # CPCB publishes. It tells a person choosing where they live nothing at all, so
 # it never reaches them. The stored station_name keeps it, byte for byte —
@@ -362,7 +346,6 @@ def compose(station_name: str, readings: dict[str, float | None],
     if overall is not None:
         lines += [
             t["score"].format(aqi=overall.aqi, band=plain[overall.band][1]),
-            band_bar(overall.band, plain),
             t["worst"].format(
                 code=overall.dominant,
                 plain=POLLUTANT_PLAIN[lang].get(overall.dominant,
