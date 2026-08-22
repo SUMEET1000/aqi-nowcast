@@ -22,6 +22,7 @@ exercised.
 """
 
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -163,6 +164,32 @@ b = compose("S", readings, OBS, at(2.0), "Outdoor worker")
 check("the label appears", "Profile: Outdoor worker" in b.text, True)
 check("and the two messages differ only by that line",
       a.text.replace("Child with asthma", "Outdoor worker"), b.text)
+
+print("The 12h forecast line — the only part of the model a person ever sees:")
+EVENING = datetime(2026, 8, 14, 13, 30, tzinfo=timezone.utc)   # 07:00 PM IST
+quiet = compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0)
+loud = compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0,
+               warn_target=EVENING)
+check("no warning by default, so four months of messages are unchanged",
+      "likely to be Very Poor" in quiet.text, False)
+check("the warning appears when the model fires",
+      "likely to be Very Poor" in loud.text, True)
+check("and it names the hour, in IST, 12-hour clock",
+      "7:00 PM IST" in loud.text, True)
+# The one claim the project cannot support. Nothing has drawn a calibration
+# curve, so a percent would be a confidence nobody measured; the cutoff is the
+# only part of the model's output with evidence behind it.
+check("no probability, no percent, no 'chance' anywhere",
+      bool(re.search(r"\d+\s*%|chance|probabilit", loud.text, re.I)), False)
+check("a quiet forecast and no forecast at all produce the SAME text",
+      quiet.text,
+      compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0,
+              warn_target=None).text)
+check("the warning does not disturb the reading above it",
+      "PM2.5: <b>72 µg/m³</b>" in loud.text, True)
+check("nor CPCB's quoted advisory below it",
+      "CPCB" in loud.text, True)
+print()
 
 print()
 if failures:

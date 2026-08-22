@@ -556,6 +556,23 @@ check("is negative the day before, positive the day after",
                           "2025-10-21T12:00:00+05:30"]))).to_numpy())],
       [-1.0, 1.0])
 
+# --stale simulates the serving lag, so it must withhold RECENT readings and
+# leave the label alone. Reversed, it would hand the model hours it cannot have
+# and the re-scored margin would be the same fiction it exists to test for.
+print("\n-- stale withholds the newest hours from the features, not from the label --")
+STALE = 7
+staled = pick(build(WIDE, 24, COORDS, stale=STALE))
+plain = pick(build(WIDE, 24, COORDS))
+check(f"lag_0 is {STALE}h older", float(plain["lag_0"] - staled["lag_0"]), float(STALE))
+check("the target is untouched", float(staled["_target"]), float(plain["_target"]))
+# Every column here carries a ramp value, i.e. an hour; lag_0 is the newest one
+# the row is allowed to have seen. trend_ is excluded because it is a difference
+# of two of them, not an hour.
+check("no feature reads past the staled lag_0",
+      float(max(v for k, v in staled.items()
+                if k.startswith(("lag_", "roll_mean")))) <= float(staled["lag_0"]),
+      True)
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {failures}")

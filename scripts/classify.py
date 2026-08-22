@@ -813,6 +813,14 @@ def main() -> int:
                          "hour and by station. Nothing is refitted — it asks "
                          "what the average over 30 stations and 24 issue hours "
                          "is hiding, which is a gate before any window product.")
+    ap.add_argument("--stale", type=int, default=0, metavar="H",
+                    help="withhold the newest H hours of readings from every "
+                         "feature, persistence included. OpenAQ publishes ~6.5h "
+                         "behind real time, so a 07:00 IST send forecasts from "
+                         "roughly the previous evening; this measures what the "
+                         "margin becomes on that input. Moves lag_0, so the row "
+                         "set differs from a stale=0 run — compare within a run, "
+                         "never across.")
     ap.add_argument("--only", action="append", choices=list(CANDIDATES))
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -824,13 +832,15 @@ def main() -> int:
     print(f"building features ({len(wide.columns)} stations, {len(wide):,} hours)...",
           flush=True)
     frames = {h: features.build(wide, h, None, spatial=False, tail=args.tail,
-                                target_window=args.window) for h in HORIZONS}
+                                target_window=args.window, stale=args.stale)
+              for h in HORIZONS}
 
     chosen = args.only or list(CANDIDATES)
     if "persistence" not in chosen:
         chosen = ["persistence"] + chosen
     print(f"tail features: {'ON' if args.tail else 'off'}   "
           f"tuning: {args.tune or 'off'}   "
+          f"input staled: {f'{args.stale}h' if args.stale else 'no'}   "
           f"{len(frames[24].columns) - 1} feature columns at h=24")
     print(f"seed {RANDOM_SEED}   event: truth > {args.threshold:.0f} ug/m3 in "
           f"any of {args.window}h from the target, tuned on {OBJECTIVE.upper()}   "

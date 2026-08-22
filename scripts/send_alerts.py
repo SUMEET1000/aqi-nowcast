@@ -85,7 +85,8 @@ def compose(station_name: str, readings: dict[str, float | None],
             observation_ts: datetime | None, now: datetime,
             profile_label: str,
             pm25_ugm3: float | None = None,
-            concentration_ts: datetime | None = None) -> Message:
+            concentration_ts: datetime | None = None,
+            warn_target: datetime | None = None) -> Message:
     """The whole message, as a pure function. See tests/test_message.py.
 
     Pure for the same reason ingest.build_rows is: this is the text a real
@@ -122,6 +123,17 @@ def compose(station_name: str, readings: dict[str, float | None],
       overall band we do not have. The documented degraded wording says what
       the number is and that the official AQI may be higher.
 
+    warn_target is the hour the promoted 12h model expects to exceed 121 µg/m³,
+    or None when it does not, when no model is promoted, or when the station's
+    reading is too stale to forecast from. All four are one branch on purpose:
+    the message says nothing rather than implying calm, because "no warning"
+    and "we could not look" must not read the same to a person deciding whether
+    to send a child outside — so neither one produces a sentence.
+
+    NO PROBABILITY EVER APPEARS HERE. See scripts/forecast.py: the cutoff is the
+    only part of the model's output with a measurement behind it, and a percent
+    would be a confidence nobody has earned.
+
     The profile appears as a label and changes nothing else. Build plan §5 asks
     for a "profile-specific advisory" and also forbids writing our own medical
     guidance; the only per-band health text that exists is CPCB's, and CPCB
@@ -156,6 +168,11 @@ def compose(station_name: str, readings: dict[str, float | None],
     if pm25_ugm3 is not None:
         lines += [f"PM2.5: <b>{pm25_ugm3:.0f} µg/m³</b> — "
                   f"{aqi.pm25_band(pm25_ugm3)}", ""]
+
+    if warn_target is not None:
+        lines += [f"⚠️ <b>Air is likely to be Very Poor around "
+                  f"{ist(warn_target)} IST.</b>",
+                  "Plan outdoor time before then.", ""]
 
     overall, refusal = aqi.overall_aqi(readings)
     if overall is not None:
@@ -195,6 +212,58 @@ def compose(station_name: str, readings: dict[str, float | None],
     return Message("\n".join(lines),
                    overall.aqi if overall else None,
                    overall.band if overall else None)
+
+
+def warnings_by_station(now: datetime) -> dict[int, datetime]:
+    """{station_id: target hour} for stations the promoted model warns about.
+
+    Every failure here degrades to an empty dict and a line on stderr, and that
+    is the one place in this script where swallowing is right rather than a §0.5
+    violation: the forecast is an addition to a message that was worth sending
+    for four months without it, so a missing model must cost the warning line
+    and not the reading. The failure is still visible — it prints, and the run's
+    fetch_log row carries the outcome — it just does not take the send with it.
+
+    Runs on its own connection, before the send opens its own, so the heavy
+    pandas work never happens with an open transaction on the sending
+    connection. Neon suspends after five minutes idle and bills per wake, so
+    two connections seconds apart are one wake, not two.
+    """
+    try:
+        import forecast
+        from baselines import CACHE, pull
+    except ImportError as exc:
+        # requirements-model.txt is not installed. Expected on a machine that
+        # only ever runs --dry-run; NOT expected in the workflow, which
+        # installs it.
+        print(f"no forecast — model dependencies missing ({exc})",
+              file=sys.stderr)
+        return {}
+
+    try:
+        pull(CACHE)
+        with connect() as conn, conn.cursor() as cur:
+            calls = forecast.outlook(cur, CACHE, now)
+    except forecast.NoModel as exc:
+        print(f"no forecast — {exc}", file=sys.stderr)
+        return {}
+    except Exception as exc:
+        print(f"no forecast — {redact(str(exc))}", file=sys.stderr)
+        return {}
+
+    if not calls:
+        # Not an exception, so it would otherwise leave no trace at all — and
+        # "the model warned nobody" and "the model was never consulted" are the
+        # two states this script must never confuse (§0.5).
+        print(f"no forecast — no station has a reading within "
+              f"{forecast.MAX_ISSUE_AGE_H}h of now; pm25_history lags OpenAQ's "
+              f"publishing", file=sys.stderr)
+        return {}
+
+    warned = {s: v["target_ts"] for s, v in calls.items() if v["warn"]}
+    print(f"forecast: {len(calls)} stations, {len(warned)} warned",
+          file=sys.stderr)
+    return warned
 
 
 def newest_bulletin(conn) -> datetime | None:
@@ -315,6 +384,9 @@ def main() -> int:
                     help="with --dry-run, render for this station only")
     ap.add_argument("--only", type=int, metavar="CHAT_ID",
                     help="send to one subscriber (used before inviting testers)")
+    ap.add_argument("--no-forecast", action="store_true",
+                    help="send the reading only, as this script did before the "
+                         "model was wired in")
     args = ap.parse_args()
 
     if args.station is not None and not args.dry_run:
@@ -323,6 +395,8 @@ def main() -> int:
     token = "" if args.dry_run else telegram_api.load_token()
     now = datetime.now(timezone.utc)
     send_date = now.astimezone(IST).date()
+
+    warn_at = {} if args.no_forecast else warnings_by_station(now)
 
     conn = connect()
     sent = failed = skipped = 0
@@ -361,7 +435,8 @@ def main() -> int:
             message = compose(station_name, by_station[station_id],
                               bulletin_ts, now, profile_label,
                               pm25_ugm3=conc[1] if conc else None,
-                              concentration_ts=conc[0] if conc else None)
+                              concentration_ts=conc[0] if conc else None,
+                              warn_target=warn_at.get(station_id))
 
             if args.dry_run:
                 print(f"\n--- chat {chat_id} | station {station_id} "

@@ -310,42 +310,51 @@ def _station_block(wide: pd.DataFrame, station: int, horizon: int,
                    weather: bool = False,
                    blh: str = "none",
                    weather_frame: pd.DataFrame | None = None,
-                   target_window: int = 1) -> pd.DataFrame:
+                   target_window: int = 1,
+                   stale: int = 0) -> pd.DataFrame:
     """One station's rows, indexed by ISSUE hour.
 
     Every column below is a backward shift or a trailing window, so no value in
     a row can carry a timestamp later than that row's index. Forecast values
     are also allowed to carry target-hour timestamps because they were issued
     before the issue hour; `_target` is future by definition.
+
+    `stale` withholds the newest `stale` hours of this station's own readings
+    from every feature, the target excepted. It answers what the margin becomes
+    on the input a 07:00 IST send actually has: OpenAQ publishes ~6.5h behind
+    real time `[measured 2026-08-22]`, so the freshest reading at send time is
+    the previous evening's. Persistence is staled with everything else, since
+    lag_0 is its prediction and it faces the same lag in production.
     """
     own = wide[station]
+    seen = own.shift(stale) if stale else own
     block = pd.DataFrame(index=wide.index)
 
     for lag in LAGS:
-        block[f"lag_{lag}"] = own.shift(lag)
+        block[f"lag_{lag}"] = seen.shift(lag)
 
     for w in ROLL_WINDOWS:
         # center=False is the default and is passed anyway: a centred window
         # reads forward, and that is the one change that would reintroduce the
         # need for a purged split. tests/test_features.py greps for it.
-        roll = own.rolling(w, min_periods=max(1, int(math.ceil(w * min_present))),
-                           center=False)
+        roll = seen.rolling(w, min_periods=max(1, int(math.ceil(w * min_present))),
+                            center=False)
         block[f"roll_mean_{w}"] = roll.mean()
         block[f"roll_std_{w}"] = roll.std()
 
     for span in TREND_SPANS:
-        block[f"trend_{span}"] = own - own.shift(span)
+        block[f"trend_{span}"] = seen - seen.shift(span)
 
     if tail:
-        for name, values in _tail_block(own, wide.index).items():
+        for name, values in _tail_block(seen, wide.index).items():
             block[name] = values
         block["diwali_days"] = _diwali_days(wide.index)
 
     if spatial and nbrs is not None:
-        near = wide[nbrs[station]].mean(axis=1)
+        near = wide[nbrs[station]].mean(axis=1).shift(stale)
         block["nbr_mean"] = near
         block[f"nbr_mean_lag_{NEIGHBOUR_LAG}"] = near.shift(NEIGHBOUR_LAG)
-        block["regional_mean"] = wide.mean(axis=1)
+        block["regional_mean"] = wide.mean(axis=1).shift(stale)
 
     if cyclical:
         ist = pd.to_datetime(wide.index * 3600, unit="s", utc=True).tz_convert(IST)
@@ -401,12 +410,25 @@ def build(wide: pd.DataFrame, horizon: int,
           weather: bool = False,
           blh: str = "none", target_window: int = TARGET_WINDOW,
           cells: dict[int, tuple[float, float]] | None = None,
-          weather_frames: dict[tuple[float, float], pd.DataFrame] | None = None
+          weather_frames: dict[tuple[float, float], pd.DataFrame] | None = None,
+          require_target: bool = True,
+          stale: int = 0
           ) -> pd.DataFrame:
     """All stations stacked. One row = one forecast, indexed by issue hour.
 
     ROW ADMISSION: a row survives only when the target is present AND lag_0 is
     present. Everything else may be NaN.
+
+    require_target=False keeps the rows whose target has not happened yet, which
+    is every row a live forecast is issued from — scripts/forecast.py is the only
+    caller. Scoring MUST leave it True: a NaN target cannot be graded, and the
+    two would silently score different sets of hours.
+
+    stale>0 withholds the newest `stale` hours of readings from the features —
+    see _station_block. It moves lag_0, so the admitted rows are NOT the same
+    rows as a stale=0 run and the two tables do not compare directly. Every
+    candidate inside one run still sits the same exam, which is the comparison
+    the question is about.
 
     That second condition is not a data-quality preference, it is the fairness
     rule. lag_0 is the persistence prediction, so requiring it means persistence
@@ -455,11 +477,14 @@ def build(wide: pd.DataFrame, horizon: int,
     blocks = [_station_block(
         wide, s, horizon, nbrs, spatial, cyclical, min_present, tail, weather, blh,
         weather_frames[cells[s]] if weather_frames is not None else None,
-        target_window)
+        target_window, stale)
               for s in wide.columns]
     out = pd.concat(blocks)
     out.index.name = "issue_hour"
-    return out[out["_target"].notna() & out["lag_0"].notna()]
+    keep = out["lag_0"].notna()
+    if require_target:
+        keep &= out["_target"].notna()
+    return out[keep]
 
 
 def split_xy(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:

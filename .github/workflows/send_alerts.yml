@@ -59,8 +59,20 @@ jobs:
           python-version-file: .python-version
           cache: pip
 
+      # requirements-model.txt is installed HERE and nowhere else in the hot
+      # path. ingest.yml runs every ~30 minutes and must stay at the single
+      # runtime dependency requirements.txt pins; this job runs once a day, so
+      # the ~300 MB of ML wheels cost one slow step a day rather than 48.
+      #
+      # It is what loads the promoted booster out of model_runs. Without it
+      # send_alerts.warnings_by_station catches the ImportError and sends the
+      # reading with no forecast line — degraded, not broken, and it says so on
+      # stderr. Watch for "no forecast — model dependencies missing" in this
+      # step's log; it means the install below silently stopped working.
       - name: Install frozen dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-model.txt
 
       # Same argument as ingest.yml's preflight: from outside the job, a missing
       # token and an unreachable database look identical, and the Actions log
