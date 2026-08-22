@@ -453,3 +453,110 @@ CREATE TABLE IF NOT EXISTS station_health (
 
     checked_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+
+-- model_runs — Phase 5. One row per monthly retrain, promoted or not.
+--
+-- Build plan §8 wants a scheduled retrain whose new model is promoted ONLY if
+-- it beats the incumbent, with both results logged either way. This table is
+-- the "either way": a challenger that loses still lands here, because the run
+-- that found no improvement is the evidence that the incumbent is still the
+-- right one. Written by scripts/retrain.py.
+--
+-- WHY THE BOOSTER LIVES IN POSTGRES AND NOT IN models/. models/ is gitignored
+-- and a GitHub runner is wiped after every job, so a file written there cannot
+-- be read by next month's run and "promotion" would mean nothing. Neon is the
+-- only durable store this project already has. Roughly 800 KB a month against
+-- a 0.5 GB free tier, and only the incumbent's row needs to keep its text —
+-- older boosters can be nulled if that ever stops being true.
+CREATE TABLE IF NOT EXISTS model_runs (
+    run_id          BIGSERIAL   PRIMARY KEY,
+    trained_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    horizon         INTEGER     NOT NULL,
+    candidate       TEXT        NOT NULL,
+
+    -- The judging window, as IST dates. The pollution day is IST, so a boundary
+    -- recorded in UTC reads as the wrong day to anyone checking it by hand.
+    train_end       DATE        NOT NULL,
+    test_start      DATE        NOT NULL,
+    test_end        DATE        NOT NULL,
+
+    -- THE COLUMN THAT STOPS f2 FROM BEING MISREAD, and the whole reason the
+    -- promoted model is useful in October rather than two months behind it.
+    --
+    -- f2 below is the RECIPE's score, measured on test_start..test_end by a
+    -- model fitted only on data before train_end. The stored booster is that
+    -- same recipe REFIT on everything up to refit_end, which is later — so the
+    -- booster has seen the test block and f2 is not its measured score. Two
+    -- different things, and the column names say so.
+    --
+    -- NULL when nothing was promoted, because nothing was refit.
+    refit_end       DATE,
+
+    n_test          INTEGER     NOT NULL,
+
+    -- Exceedance hours in the test block. retrain.MIN_TEST_EVENTS reads this:
+    -- below the floor the gate abstains rather than promoting on a month that
+    -- cannot tell two spike forecasters apart.
+    n_events        INTEGER     NOT NULL,
+
+    -- F2 is the gate. It weights recall four times precision, for the reason
+    -- classify.OBJECTIVE gives: a miss sends a child out into bad air.
+    f2              DOUBLE PRECISION,
+    recall          DOUBLE PRECISION,
+
+    -- `prec`, not `precision`. PRECISION is a keyword in Postgres (as in DOUBLE
+    -- PRECISION) and an unquoted column of that name is a trap for the next
+    -- person writing a query by hand.
+    prec            DOUBLE PRECISION,
+
+    -- Average precision, threshold-free. Recorded, never voted on. NOT MAE:
+    -- this candidate is a classifier and outputs a probability, so a µg/m³
+    -- error has nothing to measure. Reporting one would be a number that looks
+    -- comparable to the stage-1 table and is not.
+    ap              DOUBLE PRECISION,
+    ets             DOUBLE PRECISION,
+
+    -- The probability cutoff, tuned on inner validation and applied to test.
+    -- Stored because it is half the model: a booster without its cutoff cannot
+    -- issue a warning.
+    warn_above      DOUBLE PRECISION,
+
+    -- Hyperparameters, the tuned cutoff, and the feature-name list. The feature
+    -- list is checked before a stored booster is re-scored — a silent column
+    -- mismatch would grade the incumbent on the wrong inputs and read as a
+    -- genuine improvement by the challenger.
+    params          JSONB,
+
+    -- Both rivals, re-scored on THIS run's test block, never quoted from an
+    -- earlier row. A score stored a month ago was computed on different rows.
+    incumbent_f2    DOUBLE PRECISION,
+
+    -- The floor. Not part of the gate, but a month where both models fall under
+    -- persistence is the signal that the approach has stopped working, and that
+    -- is invisible unless it is recorded beside them.
+    persistence_f2  DOUBLE PRECISION,
+
+    promoted        BOOLEAN     NOT NULL,
+
+    -- Separates "the challenger lost" from "this month could not judge". Both
+    -- carry promoted = false and both are normal, but only one of them is
+    -- evidence about the model.
+    abstained       BOOLEAN     NOT NULL DEFAULT FALSE,
+
+    is_incumbent    BOOLEAN     NOT NULL DEFAULT FALSE,
+
+    -- LightGBM's own text dump (Booster.save_model()), not a pickle. A pickle
+    -- breaks on a library upgrade and this row has to outlive several.
+    booster         TEXT,
+
+    git_sha         TEXT,
+    data_sha256     TEXT
+);
+
+-- Exactly one incumbent per horizon, enforced by the database rather than
+-- remembered by the script. retrain.py clears the old flag before inserting the
+-- new row, inside one transaction, so this never sees two at once.
+CREATE UNIQUE INDEX IF NOT EXISTS model_runs_one_incumbent
+    ON model_runs (horizon) WHERE is_incumbent;

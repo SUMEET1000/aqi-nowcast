@@ -72,4 +72,9 @@ enabled = true
 # ended and pm25_history runs ~20h behind real time, so a Monday run would
 # score a week whose last hours had not arrived. .github/workflows/monitor.yml
 # carries the full reasoning.
-crons = ["5,35 * * * *", "30 1 * * *", "0 2 * * 2"]
+# The fourth is Phase 5's monthly retrain, 03:00 UTC on the 1st, dispatching
+# retrain.yml. Monthly and not weekly because the holdout is 30 days: a second
+# run inside the same month tests the incumbent on rows it was refit on, which
+# retrain.py detects and refuses to score rather than answering wrongly.
+# .github/workflows/retrain.yml carries the full reasoning.
+crons = ["5,35 * * * *", "30 1 * * *", "0 2 * * 2", "0 3 1 * *"]

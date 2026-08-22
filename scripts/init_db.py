@@ -18,7 +18,8 @@ SCHEMA = os.path.join(os.path.dirname(__file__), "..", "db", "schema.sql")
 EXPECTED_TABLES = ("stations", "observations", "fetch_log",
                    "profiles", "subscribers", "sent_log", "feedback",
                    "station_changes",
-                   "pm25_history", "drift_log", "station_health")
+                   "pm25_history", "drift_log", "station_health",
+                   "model_runs")
 
 
 def main() -> int:

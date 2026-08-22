@@ -1,0 +1,109 @@
+# Phase 5 — the monthly retrain and its promotion gate.
+#
+# Build plan §8: retrain on a schedule, promote the new model ONLY if it beats
+# the incumbent on a held-out window, and log both results either way.
+# scripts/retrain.py carries the reasoning; the two things worth knowing here:
+#
+# THIS JOB FAILING IS NOT THE ALERT, which is the opposite of monitor.yml. A
+# challenger losing is the expected monthly result and retrain.py exits 0 on it.
+# monitor.yml already owns the email-on-failure channel for real drift, and a
+# second monthly red run for a non-event is what teaches the reader to ignore
+# both. A red run here means the job broke, not that the model did.
+#
+# THE STORED MODEL LIVES IN NEON, NOT IN models/. models/ is gitignored and this
+# runner is wiped when the job ends, so a file written here could not be read by
+# next month's run. db/schema.sql's model_runs comment has the rest.
+name: retrain
+
+on:
+  # 03:00 UTC on the 1st. Monthly, because the holdout is 30 days: run it more
+  # often and the new test block still overlaps the window the incumbent was
+  # refit on, which grades the incumbent on hours it memorised. retrain.py
+  # detects that and returns CONTAMINATED rather than a false verdict, but the
+  # run is then wasted, so the schedule is set not to cause it.
+  #
+  # 03:00 rather than 02:00 to stay clear of monitor.yml's Tuesday tick, and
+  # after ingest.yml's :43 so the OpenAQ pull for the previous day has landed.
+  #
+  # Backup only, exactly as in the other three workflows: GitHub delivered 11 of
+  # ~36 requested ticks on this repo. The primary is the Cloudflare Worker in
+  # trigger/. Both firing on the same day is harmless — the second run reads the
+  # incumbent the first one just promoted, finds its refit_end inside the test
+  # block, and declines to decide.
+  schedule:
+    - cron: '0 3 1 * *'
+
+  workflow_dispatch:
+
+concurrency:
+  group: retrain
+  cancel-in-progress: false
+
+# `contents: read` and not `{}`, for the reason ingest.yml gives: actions/checkout
+# authenticates its clone with GITHUB_TOKEN, so an empty map breaks checkout.
+permissions:
+  contents: read
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    # A tuned 12h fit over ~170k rows takes a few minutes locally, plus one
+    # refit on everything. The generous cap is aimed at a hung Neon pull, not at
+    # the fitting.
+    timeout-minutes: 45
+
+    steps:
+      # SHA-pinned, not tagged, for the reason ingest.yml gives: a major tag is
+      # a branch GitHub can move, and a moved tag gets code execution in this
+      # job just before DATABASE_URL enters it. To update, read the tag's SHA
+      # (gh api repos/actions/checkout/git/ref/tags/v5) and change the SHA and
+      # its trailing comment together.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          # retrain.py records the commit it ran on in model_runs.git_sha, and
+          # benchmark._git_sha reads it from git rather than from the
+          # environment. The default shallow clone still carries HEAD, which is
+          # all that needs to resolve.
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      # Both files, unlike every other workflow here. This is the only job that
+      # runs a model, which is exactly why requirements-model.txt is separate:
+      # ingest.yml runs twice an hour and must not carry ~300 MB of ML wheels
+      # for code it never executes.
+      - name: Install frozen dependencies
+        run: pip install -r requirements.txt -r requirements-model.txt
+
+      # Same argument as the other three workflows: from outside the job a
+      # missing secret and an unreachable database look identical, and the
+      # Actions log download returns 403 without admin rights even on a public
+      # repo. Presence, length and shape only — never a value.
+      - name: Preflight — check the secret is present and well-formed
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL is empty. Add it under Settings -> Secrets and variables -> Actions -> Repository secrets."
+            exit 1
+          fi
+          echo "DATABASE_URL: present (${#DATABASE_URL} chars)"
+
+      # Proves the gate can still refuse before its verdict is trusted. No
+      # database and no network, so it costs nothing, and it is the reason a
+      # green run below is evidence. This repo has a scar: five separate checks
+      # could not fail and all five reported PASS.
+      - name: Self-test — can this gate refuse?
+        run: python scripts/retrain.py --self-test
+
+      # --refresh re-pulls pm25_history into the cache, which is gitignored and
+      # therefore absent on a fresh runner. One Neon wake; retrain.py's own
+      # connection is the second and last.
+      - name: Retrain and decide
+        env:
+          PYTHONUNBUFFERED: "1"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/retrain.py --refresh
