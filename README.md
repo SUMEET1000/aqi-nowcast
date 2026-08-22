@@ -8,15 +8,21 @@ you what the air is like *right now*; this one tells a specific person whether a
 It is deliberately **not** an AQI dashboard, a map, or a city ranking. The forecast and the
 personalised threshold are the entire product.
 
-**Status: Phase 4 of 5 — the model.** Phase 1's gate passed on 2026-08-13 (66 distinct
-bulletins, 25 of 30 stations carrying a real PM2.5 value on every one, 98.6% run success over
-214 runs), Phase 2's on 2026-08-14 when the bot went live, and Phase 3's on 2026-08-20 with the
-baseline table below — written *before* any model existed, so the goalposts could not quietly
-move.
+**Status: Phase 5 of 5 — production discipline.** Phase 1's gate passed on 2026-08-13 (66
+distinct bulletins, 25 of 30 stations carrying a real PM2.5 value on every one, 98.6% run
+success over 214 runs), Phase 2's on 2026-08-14 when the bot went live, Phase 3's on 2026-08-20
+with the baseline table below — written *before* any model existed, so the goalposts could not
+quietly move — and Phase 4's on the same day.
 
-**Phase 4's benchmark now beats that baseline on average error and loses to it at warning
-anyone, so the forecast is deliberately not switched on.** The numbers, and what it would take
-to fix, are in [The model, and why it is not switched on](#the-model-and-why-it-is-not-switched-on).
+**A model does beat the baseline at warning people, at the one horizon the product needs. It is
+wired into the message and it is switched off, because the air readings arrive about six and a
+half hours late and the win does not survive that.** The forecast is written, tested, deployed,
+and refuses to speak rather than issue a five-hour forecast wearing a twelve-hour label. Every
+number is in [The model, and why it is not switched on](#the-model-and-why-it-is-not-switched-on).
+
+Phase 5 is running: weekly drift and staleness monitoring since 2026-08-21, and a monthly
+retrain with a promotion gate since 2026-08-22. Its gate — a dated post-mortem of a real drift
+incident — cannot be written until the stubble-burning season shifts the data in October.
 
 ---
 
@@ -27,9 +33,9 @@ to fix, are in [The model, and why it is not switched on](#the-model-and-why-it-
 | 0 | Kill gates: does the data exist, do the IDs join | 3+ live PM2.5 stations, mapping doc | ✅ 2026-08-09 |
 | 1 | The hourly logger | 72h of data, >95% fetch success | ✅ 2026-08-13 |
 | 2 | Telegram bot, **no model** | 3 real users, 1 feedback row | ✅ 2026-08-14 |
-| 3 | Baselines: persistence, seasonal, climatology | per-horizon table in this README | 🔨 in progress |
-| 4 | The model — benchmarked, not assumed | beats persistence, or a documented negative | ☐ |
-| 5 | Production discipline: drift, retraining, post-mortem | a dated real incident write-up | ☐ |
+| 3 | Baselines: persistence, seasonal, climatology | per-horizon table in this README | ✅ 2026-08-20 |
+| 4 | The model — benchmarked, not assumed | beats persistence, or a documented negative | ✅ 2026-08-20 |
+| 5 | Production discipline: drift, retraining, post-mortem | a dated real incident write-up | 🔨 built, waiting on October |
 
 Shipping the bot before the model (Phase 2 before Phase 4) is intentional. It forces the
 distribution problem to the front while it can still change decisions.
@@ -66,7 +72,19 @@ Telegram ──webhook──▶ Cloudflare Worker (bot/) ───────�
                                               ▼
                                    Cloudflare Worker (trigger/) ─▶ same send, immediately
                                    holds the GitHub token
+
+Phase 5, on the same trigger and the same database:
+
+Cloudflare Worker cron (Tue 02:00 UTC) ─▶ scripts/monitor.py  ─▶ drift_log, station_health
+        │                                  exit 1 IS the alert
+Cloudflare Worker cron (1st, 03:00 UTC) ▶ scripts/retrain.py  ─▶ model_runs
+                                           model + score, stored in the database
 ```
+
+The trigger Worker carries four schedules: the two ingest ticks, the daily send, the weekly
+monitor and the monthly retrain. The model is stored **in Neon rather than on disk** because a
+cloud runner is wiped when its job finishes, so a promotion decided this month would be
+unreadable next month.
 
 Subscribing fires that day's message straight away rather than leaving someone with nothing
 until the next morning. It goes through `trigger/` rather than from `bot/` directly because
@@ -154,9 +172,15 @@ the script with `--write-doc`.
 One message per subscriber per day: the measured PM2.5 at their station in µg/m³ and its band,
 CPCB's AQI beside it labelled as the 24-hour index it is, then CPCB's own health statement for
 the **overall** AQI band, quoted and cited. Two numbers from two sources, because they are two
-different quantities over two different windows — saying so is the point. No forecast yet —
-Phase 2 sends current readings only, and a threshold alert on a current reading would just
-restate what is already out of the window.
+different quantities over two different windows — saying so is the point.
+
+**The forecast is wired in and silent.** Since 2026-08-22 the sender loads the promoted model
+and adds one line when it expects the evening to cross into Very Poor. At 07:00 IST it never
+does, because no reading is fresh enough to forecast from, and it refuses rather than issue a
+short forecast under a long label. Two rules hold whenever it does speak: **no percentage
+appears, ever**, since nothing here has checked whether a predicted probability means anything;
+and **"no warning" and "we could not look" produce the same output — no line at all**, so an
+absent warning can never read as reassurance.
 
 The send time is measured, not chosen. **CPCB's feed freezes every morning**: over four days
 the last morning bulletin was 05:00 IST and the next arrived between 10:00 and 13:00, with no
@@ -442,12 +466,98 @@ when the decision is about an evening, and the tuner optimised CSI while the tab
 **The corrected metric produced a better-looking answer than the broken one, which is exactly
 when to audit hardest.**
 
-### What it needs
+### What the average over 30 stations was hiding
 
-Not weather, on this evidence. What is still untried is calibration — nothing yet checks whether
-a predicted probability means anything, which a message saying "70% chance" would require — and
-a per-station breakdown, since every number here is averaged over 30 stations and may be hiding
-stations the alert would serve badly.
+Every number above is a mean over 30 stations and four folds. Measured **2026-08-21**, the same
+test predictions regrouped, nothing refitted: `python scripts/classify.py --tail --route --breakdown`.
+
+**The win holds at the send hour.** Pooling all 24 issue hours could have been flattering the
+result, since the message only ever goes out at one of them.
+
+| horizon | rows scored | events | persistence F2 | best F2 | margin |
+|---|---|---|---|---|---|
+| 6h | all 24 issue hours | 14,144 | 0.528 | 0.639 | +0.111 |
+| 6h | **07:00 IST only** | 378 | 0.385 | 0.417 | **+0.032** |
+| **12h** | all 24 issue hours | 13,811 | 0.488 | 0.603 | +0.115 |
+| **12h** | **07:00 IST only** | 695 | 0.541 | 0.641 | **+0.100** |
+
+12h holds. 6h collapses — from a 07:00 send, 6h ahead is early afternoon, a different regime
+from the pooled average. 6h had not cleared the bar anyway, but it is the clearest evidence that
+pooling issue hours hides things.
+
+**Eight of 29 stations score below persistence — and reading that as "eight stations are served
+badly" would be wrong.** Only **two** are below it in every fold. The other six flip sign
+between folds, which means their pooled result was decided by one noisy draw. A per-station
+margin without a fold count beside it turns an artefact into a claim about a place.
+
+**Serving each station whichever forecaster won on its own validation window lost all 16
+horizon-fold cells** to simply using the model everywhere. The cause is sample size: the median
+station-fold validation window holds 51 exceedance hours and the bottom quarter under 8, against
+13,811 for the pooled decision. No minimum-sample floor rescues it — raising the floor sends
+more stations to persistence, and persistence is the worse option on average. The routing code
+is kept, off by default, as the record that it was tried.
+
+### The measurement that stopped the forecast shipping
+
+Every score above was computed on an air reading from the current hour. **At 07:00 IST the
+service does not have one.** OpenAQ publishes about six and a half hours behind real time, so
+the freshest reading at send time is from roughly midnight.
+
+That was never tested until the model was already wired into the message. Measured
+**2026-08-22**, `python scripts/classify.py --tail --stale 7`, which withholds the newest seven
+hours from every feature — persistence included, since it faces the same lag in production.
+
+| run | persistence F2 at 12h | best F2 | margin | fold std | clears the bar |
+|---|---|---|---|---|---|
+| current-hour reading | 0.468 | 0.582 | +0.114 | 0.112 | yes, 1 of 4 horizons |
+| **the reading it will really get** | 0.500 | 0.584 | **+0.084** | 0.116 | **no, 0 of 4** |
+
+At 07:00 IST specifically, the 12h margin falls from +0.100 to +0.063.
+
+**The model did not get worse — the baseline got better, and that distinction is the finding.**
+Best F2 at 12h moves 0.582 to 0.584, which is nothing. Persistence rises 0.468 to 0.500, because
+a stale reading sits about 19 hours from the target instead of 12, and 19 hours is nearer a whole
+daily cycle. It lands on roughly the same point of the pollution day — the same reason
+persistence is strong at 24h. The margin closed from the baseline's side. Describing this as
+model degradation would be a false sentence about a true table.
+
+So the forecast line is deliberately dark. The guard that produces that refusal must not be
+relaxed to make the line appear: raising the staleness limit does not buy a twelve-hour
+forecast, only a five-hour forecast with a twelve-hour label on it.
+
+### The obvious fix, and why it is also a negative
+
+CPCB's own feed is fresh every thirty minutes. Serving from it instead of OpenAQ looks like the
+way past the lag. Measured **2026-08-22**, `python scripts/probe_cpcb_signal.py` — read-only,
+no model trained, because it compares two *inputs* rather than grading a forecaster and so needs
+13 days rather than three months.
+
+**CPCB is genuinely fresh at the send hour:** median age 2.0 hours at 07:00 IST, inside the
+three-hour limit. That half was right.
+
+**And it buys nothing.** Ranking evenings above 121 µg/m³ twelve hours ahead, on identical rows:
+
+| serve-time input | how well it ranks bad evenings |
+|---|---|
+| CPCB, fresh at issue | **0.863** |
+| OpenAQ, 7h stale, raw reading | 0.782 |
+| **OpenAQ, 7h stale, 24-hour average** | **0.851** |
+
+Against the raw stale reading, CPCB looks worth +0.081. Against a **stale but averaged** OpenAQ
+it is worth **+0.012, on a sampling error of 0.032**. CPCB's published number is itself a
+24-hour average, and averaging on its own cancels hour-to-hour noise — so the apparent gain was
+smoothing, not freshness. The existing feature set already computes a 24-hour rolling mean.
+
+**The first version of that probe had no averaged rival in it and printed the opposite verdict.**
+It was added before the result was written down, and it reversed it. That is the same fault as
+the persistence baseline further up: a rival that cannot compete makes the candidate look good
+by construction.
+
+### What is still untried
+
+Calibration. Nothing yet checks whether a predicted probability means anything, and a message
+saying "70% chance" would require it. Until then the alert carries no percentage at all — the
+tuned cutoff is the only part of the model's output with a measurement behind it.
 
 ### Method notes
 
@@ -481,6 +591,70 @@ stations the alert would serve badly.
 Exploratory analysis, with the plots and the cleaning evidence, is in
 [`notebooks/01_eda_cleaning.ipynb`](notebooks/01_eda_cleaning.ipynb) and its generated summary
 [`docs/eda.md`](docs/eda.md).
+
+---
+
+## Keeping it working: drift, staleness, and retraining
+
+A forecasting service is mostly the machinery around the forecast. Two jobs run on their own
+schedule, and neither needs anyone to look at a dashboard.
+
+### Weekly: is a station dark, and has the air changed shape?
+
+`python scripts/monitor.py`, every Tuesday. **The alert channel is the exit code** — the job
+fails, and the failure notification is the alert. That deliberately adds no second place for a
+credential to live.
+
+- **Staleness** reads the CPCB feed, because it is the one that is live. The limit is 12 hours,
+  not 3, because CPCB's morning freeze runs up to 8 hours and a 3-hour rule would report all 30
+  stations dark every morning.
+- **Drift** reads the measured concentrations instead, because those are real µg/m³. Both checks
+  fire on **change**, never on state, so a bad week that stays bad alerts once.
+
+**The threshold was validated by replaying it against a real event, which is the only reason to
+believe it.** The whole history was backfilled first — 1,393 station-weeks over 77 weeks back to
+2025-02-17 — and the rule raises **exactly one alert in those 77 weeks: 2025-10-20**, the start
+of that year's stubble-burning season.
+
+**The first version of the check alerted on nothing at all, and only the replay found it.** It
+guarded against the station list changing by rejecting any week whose station count had moved —
+and the network was being built out from 1 station to 29 across exactly the weeks of the 2025
+stubble season. The guard discarded the event it existed to catch, while still firing on
+single-station weeks elsewhere. Both faults had one cause: comparing an average over one set of
+stations against an average over a different set. Fixed by intersecting the two station sets
+before averaging. **A check that cannot fire is the same defect as a check that cannot fail, and
+neither shows up until it is replayed against something real.**
+
+### Monthly: retrain, and refuse to promote unless it earns it
+
+`python scripts/retrain.py`, on the first of the month. The model and its score are stored in
+the database, not on disk, because a cloud runner is wiped when its job ends.
+
+The scoring window is derived from the data rather than fixed, so a monthly job cannot re-score
+the same rows forever. **Training is the whole history, never a rolling window** — on 18 months
+of data a rolling window would delete the only winter the model has seen.
+
+**The recipe is judged on a held-out month, then refit on everything before it is stored.** A
+model fitted only up to the judging window stops learning about two and a half months before it
+is served, so one promoted on 1 November would have been trained on August air and sent into
+peak stubble season.
+
+The gate refuses four ways, and a test proves each one can fire:
+
+| Refusal | Why |
+|---|---|
+| The margin is inside the noise | Two models a hair apart is not evidence |
+| Fewer than 100 exceedance hours in the month | A quiet month would decide it on a coin flip |
+| There is no incumbent yet | Nothing to compare against |
+| The incumbent was refit on hours it is now being graded on | It would be marked on work it had memorised |
+
+That last one is measured, not argued: run twice in one month, the incumbent scores **0.373 on
+the block it had memorised against a challenger's honest 0.321** — a gate that cannot unseat
+anyone while still printing a verdict.
+
+**A challenger losing is the normal monthly result, so this job exits successfully when that
+happens.** Only a broken job goes red. A second red notification for a non-event would devalue
+the one that means something.
 
 ---
 
@@ -624,6 +798,23 @@ Stated here rather than discovered by a reader.
   this; relative thresholds may be needed.
 - Seasonality cuts both ways: if the alert only matters for eight weeks a year, the pipeline and
   monitoring are what keep producing evidence the rest of the time.
+- **The forecast is deployed and silent, and it stays that way until the input lag is solved.**
+  The measured air readings arrive about six and a half hours late, so at the send hour the
+  model would be forecasting from the previous evening. Rather than relax the freshness guard,
+  the message goes out exactly as it did before the model existed.
+
+**The model**
+- **One winter.** The training history reaches back to February 2025, so the model has seen the
+  2025 stubble season once and nothing before it. That is a real limit on a seasonal problem
+  and it fixes itself next year rather than by any change to the code.
+- **Two stations are served worse than persistence in every fold**, and six more are worse only
+  on the pooled average. Routing each station to whichever forecaster suits it was built,
+  measured, and lost every cell — so the model is served everywhere and those two stations are
+  a known open item, not a solved one.
+- **One station is not graded at all.** The historical archive returns an error for it on every
+  attempt, so it is named in the output rather than dropped quietly.
+- **No calibration.** The model outputs a probability and nothing has checked whether that
+  probability means what it says, so the message states no percentage.
 
 ---
 
