@@ -21,6 +21,12 @@ const CB_DARK = "dark";
 const CB_PROFILE = "pr";
 const CB_FEEDBACK = "fb";
 
+// Rolling windows, not calendar day and week. A rolling window needs no
+// timezone at all, where a calendar one would have to agree with the IST date
+// send_alerts.py computes — a second place for the same decision to drift.
+const MAX_CHANGES_DAY = 2;
+const MAX_CHANGES_WEEK = 4;
+
 const DISCLAIMER =
   "This is not medical advice. Every health sentence in these messages is " +
   "quoted from CPCB's own published AQI advisory and cited to the document " +
@@ -123,6 +129,35 @@ function profileKeyboard(profiles, stationId) {
   };
 }
 
+// Records a station change and answers whether it was allowed, in one
+// statement. Counting first and inserting second would let two fast taps both
+// read "1 so far" and both pass; here the WHERE and the INSERT are the same
+// statement, so the second tap counts the first.
+//
+// The purge rides along in a CTE rather than costing its own round trip.
+// It cannot affect the counts: a CTE sees one snapshot, and rows older than
+// seven days fall outside both windows anyway.
+//
+// tests/test_station_limit.py runs this same shape against Neon and reads the
+// two constants above out of this file, so the numbers cannot drift apart.
+async function allowChange(sql, chatId) {
+  const rows = await sql`
+    WITH purge AS (
+      DELETE FROM station_changes WHERE changed_at < now() - interval '7 days'
+    )
+    INSERT INTO station_changes (chat_id)
+    SELECT ${chatId}
+    WHERE (SELECT count(*) FROM station_changes
+           WHERE chat_id = ${chatId}
+             AND changed_at > now() - interval '24 hours') < ${MAX_CHANGES_DAY}
+      AND (SELECT count(*) FROM station_changes
+           WHERE chat_id = ${chatId}
+             AND changed_at > now() - interval '7 days') < ${MAX_CHANGES_WEEK}
+    RETURNING chat_id
+  `;
+  return rows.length > 0;
+}
+
 async function onCommand(env, sql, chatId, text) {
   const command = text.trim().split(/[\s@]/)[0].toLowerCase();
 
@@ -162,7 +197,8 @@ async function onCommand(env, sql, chatId, text) {
         `Your Telegram chat id, your station, and your profile. Nothing else — ` +
         `no name, no location, no health record. /stop deletes the row.\n\n` +
         `<b>Commands</b>\n` +
-        `/stations — change station\n` +
+        `/stations — change station (up to ${MAX_CHANGES_DAY} a day, ` +
+        `${MAX_CHANGES_WEEK} a week)\n` +
         `/pause — stop the daily message, keep the subscription\n` +
         `/stop — delete the subscription\n\n` +
         `${DISCLAIMER}`,
@@ -258,32 +294,82 @@ async function onCallback(env, sql, query) {
       await answer(env, query.id, "That station no longer exists. Send /stations.");
       return;
     }
+    // Read before the upsert, because after it there is no way left to tell a
+    // first signup from a switch from a re-pick of the station they are
+    // already on — and those three cases dispatch differently below.
+    const before = await sql`
+      SELECT station_id FROM subscribers WHERE chat_id = ${chatId}
+    `;
+    const stationId = Number(a);
+    const isSwitch = before.length > 0 && before[0].station_id !== stationId;
+
+    // The station always moves, on every path. Only the immediate send is
+    // ever withheld.
     await sql`
       INSERT INTO subscribers (chat_id, station_id, profile_id, is_paused)
-      VALUES (${chatId}, ${Number(a)}, ${b}, FALSE)
+      VALUES (${chatId}, ${stationId}, ${b}, FALSE)
       ON CONFLICT (chat_id) DO UPDATE SET
         station_id = EXCLUDED.station_id,
         profile_id = EXCLUDED.profile_id,
         is_paused  = FALSE
     `;
+
+    const name = esc(shortName(stations[0].station_name));
+
+    // Re-picking the station you are already on used to dispatch anyway. No
+    // duplicate message came of it — send_alerts.py's already_sent() holds —
+    // but the run started, woke Neon, found a sent_log row for
+    // (chat_id, today, station_id) and sent nothing. A whole workflow for a
+    // no-op, on every tap.
+    if (before.length > 0 && !isSwitch) {
+      await answer(env, query.id, "Already on this station");
+      await send(
+        env,
+        chatId,
+        `You are already subscribed to <b>${name}</b>. Nothing changed.\n\n` +
+          `Your next message arrives at 7:00 AM IST.`,
+      );
+      return;
+    }
+
+    if (isSwitch && !(await allowChange(sql, chatId))) {
+      await answer(env, query.id, "Switched — daily change limit reached");
+      await send(
+        env,
+        chatId,
+        `Switched to <b>${name}</b>.\n\n` +
+          `Station changes are capped at ${MAX_CHANGES_DAY} a day and ` +
+          `${MAX_CHANGES_WEEK} a week, so today's reading is not being fetched ` +
+          `right now — each one wakes the database and starts a job, and the ` +
+          `cap is what keeps this bot free to run.\n\n` +
+          `Your next message arrives at 7:00 AM IST for <b>${name}</b>.`,
+      );
+      return;
+    }
+
     // Fired before the confirmation, not after, and awaited. If the dispatch
     // fails this handler throws, Telegram redelivers the same tap, and the
     // upsert above runs again harmlessly — so the retry costs a repeated
     // spinner rather than a duplicate "Subscribed" message.
     //
+    // On a redelivery the gate has already consumed one of the day's changes
+    // and isSwitch is now false, so the retry takes the branch above and this
+    // line is not reached twice.
+    //
     // Today's message, not an extra one: send_alerts.py skips anyone already
     // holding a sent_log row for today, and sent_log's UNIQUE (chat_id,
-    // send_date) is the backstop if two runs land together.
+    // send_date, station_id) is the backstop if two runs land together.
     await env.TRIGGER.fetch("https://trigger/send", { method: "POST" });
 
     await answer(env, query.id, "Subscribed");
     await send(
       env,
       chatId,
-      `Subscribed to <b>${esc(shortName(stations[0].station_name))}</b>.\n\n` +
+      `Subscribed to <b>${name}</b>.\n\n` +
         `Today's reading is on its way — it takes a minute or two. After that, ` +
         `one message every morning at 7:00 AM IST. Change station with ` +
-        `/stations, stop with /stop.`,
+        `/stations (up to ${MAX_CHANGES_DAY} a day, ${MAX_CHANGES_WEEK} a ` +
+        `week), stop with /stop.`,
     );
     return;
   }

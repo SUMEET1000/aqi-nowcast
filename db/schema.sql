@@ -203,6 +203,32 @@ CREATE TABLE IF NOT EXISTS subscribers (
 );
 
 
+-- station_changes — one row per station switch, for rate limiting.
+--
+-- Changing station fires an immediate send (bot/src/index.js dispatches
+-- send_alerts.yml over the service binding), which is a GitHub Actions run and
+-- a Neon wake. The row below is free; the dispatch is the entire cost, and
+-- without a cap one person cycling stations spends 30 of them in a minute.
+--
+-- Deliberately NOT a foreign key to subscribers, and not for the same reason
+-- as feedback. /stop deletes the subscriber row, so a foreign key with ON
+-- DELETE CASCADE would make /stop then /start a one-tap way to clear your own
+-- limit. Keeping these rows is what makes the cap hold.
+--
+-- Two columns and nothing else (build plan §5). A chat id and a timestamp
+-- cannot say anything about a person beyond "this account switched station",
+-- and rows age out after 7 days inside the bot's own gate query.
+CREATE TABLE IF NOT EXISTS station_changes (
+    chat_id    BIGINT      NOT NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Both halves of the gate filter chat_id and then a time range, so the index
+-- is used by the daily count and the weekly count alike.
+CREATE INDEX IF NOT EXISTS station_changes_chat_time
+    ON station_changes (chat_id, changed_at);
+
+
 -- sent_log — one row per message actually delivered.
 --
 -- Two jobs. It stops a double-send when the sender is re-run or the workflow
