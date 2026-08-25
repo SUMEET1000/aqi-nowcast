@@ -25,7 +25,7 @@ const REPO = "aqi-nowcast";
 const WORKFLOWS = {
   "5,35 * * * *": "ingest.yml",
   "30 1 * * *": "send_alerts.yml", // 07:00 IST
-  "0 2 * * 2": "monitor.yml", // Tuesday, after the scored week's data lands
+  "0 2,3,4 * * 2": "monitor.yml", // Tuesday, after the scored week's data lands
   "0 3 1 * *": "retrain.yml", // 1st of the month, the promotion gate
 };
 
