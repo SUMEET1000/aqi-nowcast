@@ -53,7 +53,7 @@ const ATTEMPTS = 3;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function attemptDispatch(env, workflow) {
+async function attemptDispatch(env, workflow, inputs) {
   const res = await fetch(endpoint(workflow), {
     method: "POST",
     headers: {
@@ -66,7 +66,7 @@ async function attemptDispatch(env, workflow) {
     },
     // `ref` is required. The workflow is read from this branch, and GitHub only
     // runs `schedule:`/dispatch against the default branch.
-    body: JSON.stringify({ ref: "main" }),
+    body: JSON.stringify({ ref: "main", inputs }),
   });
 
   // No silent fallbacks (build plan §0.5). GitHub's REST docs are inconsistent
@@ -89,11 +89,11 @@ async function attemptDispatch(env, workflow) {
   throw err;
 }
 
-async function dispatch(env, workflow) {
+async function dispatch(env, workflow, inputs = {}) {
   let last;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     try {
-      return await attemptDispatch(env, workflow);
+      return await attemptDispatch(env, workflow, inputs);
     } catch (e) {
       last = e;
       // A network-level rejection has no .permanent, so it retries — that is
@@ -140,12 +140,16 @@ export default {
   // subscribes, and this is how it gets one without the GitHub PAT moving into
   // an internet-facing process.
   //
-  // No inputs. send_alerts.py sends to every unpaused subscriber with no
-  // sent_log row for today, so a run started by a new subscription is a no-op
-  // for everyone who already has their message.
+  // send_alerts.py sends to every unpaused subscriber with no sent_log row for
+  // today, so a run started by one new subscription is a no-op for everyone who
+  // already has their message.
+  //
+  // fast: true because somebody is watching a spinner here, unlike on the cron.
+  // It halves the run — see the input's comment in send_alerts.yml for what it
+  // gives up.
   async fetch(request, env) {
     if (request.method !== "POST") return new Response("not found", { status: 404 });
-    await dispatch(env, "send_alerts.yml");
+    await dispatch(env, "send_alerts.yml", { fast: true });
     return new Response("ok");
   },
 };

@@ -28,6 +28,20 @@ on:
     - cron: '30 1 * * *'
 
   workflow_dispatch:
+    inputs:
+      # Set only by trigger/'s fetch handler, i.e. a signup or a station change,
+      # where a person is watching a spinner. It drops the two steps that do not
+      # affect what that message says: requirements-model.txt (49s of a 78s run
+      # [measured 2026-08-25: run 32877498644 step timings]) and the send-window
+      # check, which is a daily question and not this message's.
+      #
+      # The cost is the forecast line, which forecast.outlook() refuses every
+      # morning anyway. Once the October --stale 7 re-run clears and the line
+      # starts rendering, a fast run omits it and the 07:00 message does not.
+      fast:
+        description: "Skip model deps and the send-window check"
+        type: boolean
+        default: false
 
 concurrency:
   group: send_alerts
@@ -70,9 +84,11 @@ jobs:
       # stderr. Watch for "no forecast — model dependencies missing" in this
       # step's log; it means the install below silently stopped working.
       - name: Install frozen dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install -r requirements-model.txt
+        run: pip install -r requirements.txt
+
+      - name: Install model dependencies
+        if: ${{ !inputs.fast }}
+        run: pip install -r requirements-model.txt
 
       # Same argument as ingest.yml's preflight: from outside the job, a missing
       # token and an unreachable database look identical, and the Actions log
@@ -119,7 +135,7 @@ jobs:
       # `if: always()` so it still runs when the send failed: "did anyone get a
       # message" and "is 07:00 still the right hour" are independent questions.
       - name: Is 07:00 IST still fresh?
-        if: always()
+        if: ${{ always() && !inputs.fast }}
         env:
           PYTHONUNBUFFERED: "1"
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
