@@ -32,11 +32,17 @@ import argparse
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import NamedTuple
 
 import aqi
 import telegram_api
+# The window block's definitions come from the probe that MEASURED them, rather
+# than being restated here. WINDOWS, MIN_READINGS and rank() decide both what
+# ships and what the 41.6% hit rate was computed over, so a copy would let the
+# published number stop describing the product without anything going red.
+# Stdlib-only underneath (baselines + env), so this adds no dependency.
+import probe_window_shape as wshape
 from cpcb_api import IST
 from db import connect, redact
 from ingest import annotate, clean_detail, step_summary
@@ -166,6 +172,9 @@ TEXT = {
                       "us a few hours late — this is normal."),
         "stale":     ("⚠️ Nothing new since {t} — {h} hours ago. That is much "
                       "later than usual. The sensor here may have stopped."),
+        "win_clean": "Cleanest time today: <b>{w}</b>",
+        "win_worst": "Worst time today: {w}",
+        "win_level": "The air here stays about the same all day.",
         "for":       "For: {p}",
         "rate":      "Was this useful today?",
         "dark":      ("There is no reading right now. The government sensor "
@@ -193,6 +202,9 @@ TEXT = {
                       "देर से पहुँचती है — यह आम बात है।"),
         "stale":     ("⚠️ {t} के बाद कुछ नया नहीं आया — {h} घंटे पहले। यह आम से "
                       "काफ़ी ज़्यादा देर है। यहाँ की मशीन बंद हो सकती है।"),
+        "win_clean": "आज सबसे साफ़ समय: <b>{w}</b>",
+        "win_worst": "आज सबसे खराब समय: {w}",
+        "win_level": "यहाँ की हवा पूरे दिन लगभग एक जैसी रहती है।",
         "for":       "किसके लिए: {p}",
         "rate":      "क्या यह आज काम आया?",
         "dark":      ("अभी कोई रीडिंग नहीं है। इस जगह की सरकारी मशीन फ़िलहाल "
@@ -200,6 +212,25 @@ TEXT = {
                       "हो जाता है।\n\n"
                       "आपका सब्सक्रिप्शन चालू है। दूसरी जगह चुनने के लिए "
                       "/stations भेजें।"),
+    },
+}
+
+# Each window's plain label, hours included, because "evening" alone leaves the
+# reader guessing where it starts. The hours must match wshape.WINDOWS, which is
+# what the ranking is computed over; a label saying 4 PM against a window
+# starting at 3 PM would be a quiet lie rather than a crash.
+WINDOW_NAMES = {
+    "en": {
+        "morning":   "morning, 6 AM to 11 AM",
+        "afternoon": "afternoon, 11 AM to 4 PM",
+        "evening":   "evening, 4 PM to 9 PM",
+        "night":     "night, 9 PM to 6 AM",
+    },
+    "hi": {
+        "morning":   "सुबह, 6 से 11 बजे",
+        "afternoon": "दोपहर, 11 से 4 बजे",
+        "evening":   "शाम, 4 से 9 बजे",
+        "night":     "रात, 9 बजे से सुबह 6 बजे",
     },
 }
 
@@ -233,6 +264,7 @@ def compose(station_name: str, readings: dict[str, float | None],
             pm25_ugm3: float | None = None,
             concentration_ts: datetime | None = None,
             warn_target: datetime | None = None,
+            window: tuple[str, str, float] | None = None,
             lang: str = "en") -> Message:
     """The whole message, as a pure function. See tests/test_message.py.
 
@@ -304,6 +336,27 @@ def compose(station_name: str, readings: dict[str, float | None],
     only part of the model's output with a measurement behind it, and a percent
     would be a confidence nobody has earned.
 
+    `window` is (cleanest, worst, spread) from the station's own trailing 7-day
+    pattern — NOT from the model, which refuses every morning because OpenAQ
+    publishes 5-11h late. One argument holding three states, so an invalid
+    combination cannot be constructed:
+
+    - None — too little history to build a shape. NO block at all. This is a
+      different fact from a level day and must not read the same; a dead sensor
+      is not calm weather.
+    - spread below wshape.MIN_SPREAD — say the day is level. On a flat pattern
+      the ranking is right 31.4% of the time against a 25% floor, so naming a
+      window there would be close to guessing out loud.
+    - otherwise — name both ends.
+
+    The gate lives here rather than in the caller so tests/test_message.py can
+    drive all three branches with no database, and so lowering MIN_SPREAD to
+    make the block appear cannot skip a test.
+
+    It sits BELOW the model's warning and above the AQI: the warning is rare and
+    urgent, the window is routine, and burying a rare alarm under a routine line
+    is how an alarm stops being read.
+
     The profile appears as a label and changes nothing else. Build plan §5 asks
     for a "profile-specific advisory" and also forbids writing our own medical
     guidance; the only per-band health text that exists is CPCB's, and CPCB
@@ -341,6 +394,15 @@ def compose(station_name: str, readings: dict[str, float | None],
 
     if warn_target is not None:
         lines += [t["warn"].format(t=ist(warn_target)), ""]
+
+    if window is not None:
+        cleanest, worst, spread = window
+        if spread < wshape.MIN_SPREAD:
+            lines += [t["win_level"], ""]
+        else:
+            names = WINDOW_NAMES[lang]
+            lines += [t["win_clean"].format(w=names[cleanest]),
+                      t["win_worst"].format(w=names[worst]), ""]
 
     overall, refusal = aqi.overall_aqi(readings)
     if overall is not None:
@@ -483,6 +545,81 @@ def concentrations(conn, station_ids: list[int]
     return out
 
 
+LOOKBACK_DAYS = 7
+
+# Whole IST days only. Today is in progress at 07:00 and its shape would be
+# three-quarters missing, and bucket() would then reject the day for falling
+# under MIN_READINGS anyway — asking for it just moves the rejection later.
+# +1 covers the partial day at each end of the UTC/IST offset.
+_WINDOW_QUERY = """
+SELECT station_id, observation_ts, value
+FROM pm25_history
+WHERE station_id = ANY(%s)
+  AND observation_ts >= %s
+  AND observation_ts <  %s
+"""
+
+
+def window_shapes(conn, station_ids: list[int], now: datetime
+                  ) -> dict[int, tuple[str, str, float]]:
+    """{station_id: (cleanest, worst, spread)} from each station's own 7 days.
+
+    Runs on the connection the send already holds, so it costs no extra Neon
+    wake — the whole reason this reads the database directly rather than the
+    data/pm25_history.csv cache that baselines and forecast share. That cache
+    needs requirements-model.txt and is only refreshed inside the forecast path,
+    which bails out every morning; the block would then have been silently
+    driven by whatever week-old CSV happened to be on disk.
+
+    Every number here comes out of probe_window_shape, never restated: bucket()
+    puts readings into IST 06:00-05:59 days and drops exact zeros, shape_over()
+    pools 7 days into one median per window, rank() picks the ends. `[measured
+    2026-08-24: 41.6% cleanest / 40.0% worst over 6,942 station-days against a
+    25% floor]`
+
+    A station missing from the returned dict has too little history for a shape
+    and gets no block. That is deliberate silence, not a level day.
+
+    Degrades to {} on any failure, printing to stderr — the same call this
+    script already makes for the forecast, and for the same reason: the message
+    was worth sending for four months without this line, so a broken block must
+    not cost anyone their reading. The failure stays visible (§0.5).
+    """
+    try:
+        # bucket() keys days off IST, so the fetch window is cut in IST too and
+        # then handed back as UTC, which is what the column stores.
+        today_ist = (now.astimezone(IST) - timedelta(hours=6)).date()
+        start_ist = datetime.combine(today_ist - timedelta(days=LOOKBACK_DAYS),
+                                     time(6, 0), tzinfo=IST)
+        end_ist = datetime.combine(today_ist, time(6, 0), tzinfo=IST)
+
+        series: dict[int, dict[int, float]] = {}
+        with conn.cursor() as cur:
+            cur.execute(_WINDOW_QUERY, (station_ids, start_ist, end_ist))
+            for station_id, ts, value in cur.fetchall():
+                # to_hour, spelled out rather than imported: features.py lives
+                # behind requirements-model.txt and this path must not.
+                hour = int(ts.timestamp()) // 3600
+                series.setdefault(station_id, {})[hour] = float(value)
+
+        buckets = wshape.bucket(series)
+        out: dict[int, tuple[str, str, float]] = {}
+        for station_id, days in buckets.items():
+            shape = wshape.shape_over(days, list(days))
+            if shape is not None:
+                out[station_id] = wshape.rank(shape)
+
+        named = sum(1 for v in out.values() if v[2] >= wshape.MIN_SPREAD)
+        print(f"windows: {len(out)}/{len(station_ids)} stations have a shape, "
+              f"{named} clear MIN_SPREAD={wshape.MIN_SPREAD:.0f}",
+              file=sys.stderr)
+        return out
+
+    except Exception as exc:
+        print(f"no windows — {redact(str(exc))}", file=sys.stderr)
+        return {}
+
+
 def subscribers(conn, only: int | None) -> list[tuple]:
     """(chat_id, station_id, station_name, profile_label, lang), unpaused only.
 
@@ -557,6 +694,9 @@ def main() -> int:
     ap.add_argument("--no-forecast", action="store_true",
                     help="send the reading only, as this script did before the "
                          "model was wired in")
+    ap.add_argument("--no-windows", action="store_true",
+                    help="drop the cleanest/worst time block, to see the "
+                         "message as it read before 2026-08-25")
     args = ap.parse_args()
 
     if args.station is not None and not args.dry_run:
@@ -592,6 +732,7 @@ def main() -> int:
         station_ids = sorted({r[1] for r in rows})
         by_station = readings_at(conn, bulletin_ts, station_ids)
         by_conc = concentrations(conn, station_ids)
+        by_window = {} if args.no_windows else window_shapes(conn, station_ids, now)
 
         for chat_id, station_id, station_name, profile_label, lang in rows:
             if (chat_id, station_id) in done:
@@ -607,6 +748,7 @@ def main() -> int:
                               pm25_ugm3=conc[1] if conc else None,
                               concentration_ts=conc[0] if conc else None,
                               warn_target=warn_at.get(station_id),
+                              window=by_window.get(station_id),
                               lang=lang)
 
             if args.dry_run:

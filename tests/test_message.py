@@ -39,11 +39,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import env  # noqa: E402, F401  (UTF-8 console, for the Devanagari below)
 from aqi import ADVISORY, ADVISORY_CITATION  # noqa: E402
-from send_alerts import (LANGS, STALE_AFTER_H, TEXT, compose,  # noqa: E402
-                         feedback_keyboard, lang_of)
+from probe_window_shape import MIN_SPREAD  # noqa: E402
+from probe_window_shape import WINDOWS as wshape_windows  # noqa: E402
+from send_alerts import (LANGS, STALE_AFTER_H, TEXT, WINDOW_NAMES,  # noqa: E402
+                         compose, feedback_keyboard, lang_of)
 
 OBS = datetime(2026, 8, 13, 23, 30, tzinfo=timezone.utc)  # 05:00 IST next day
 PROFILE = "Child with asthma"
+
+# (cleanest, worst, spread) as window_shapes() hands them over.
+#
+# THESE SPREADS ARE ABSOLUTE µg/m³ ON PURPOSE, and the first version of this
+# file had them as MIN_SPREAD ± 5.0 — which moved the fixtures with the constant
+# and made the gate unfailable: setting MIN_SPREAD to 0.0 left every check
+# green. Same class as the five unfailable checks of 2026-08-11. A day with a
+# 60 µg/m³ swing is pronounced and a day with an 8 µg/m³ swing is level whatever
+# anyone sets the gate to; the constant is asserted to sit between them instead,
+# just below, so moving it in either direction turns this file red.
+SHAPED = ("morning", "evening", 60.0)
+LEVEL = ("morning", "evening", 8.0)
 
 failures = 0
 
@@ -68,9 +82,12 @@ print("The full path — the dust number leads, the advisory follows the OVERALL
 # pm25_history. PM10's sub-index of 250 puts the overall AQI in Poor while the
 # 40 µg/m³ concentration is Satisfactory on its own — the advisory must be
 # Poor's, or we understate exactly when it matters.
+# The window block rides on this fixture rather than only on its own, so the
+# emoji-line count and the BANNED vocabulary sweep below both see it. A block
+# only ever exercised in isolation is a block those two checks do not cover.
 m = compose("Sector-51, Gurugram - HSPCB",
             {"PM2.5": 75.0, "PM10": 250.0, "NO2": 30.0}, OBS, at(2.0), PROFILE,
-            pm25_ugm3=40.0, concentration_ts=OBS)
+            pm25_ugm3=40.0, concentration_ts=OBS, window=SHAPED)
 check("the headline is the measured dust number, with its unit",
       "Fine dust in the air (PM2.5): <b>40 µg/m³</b>" in m.text, True)
 check("with its band said in plain words, not a CPCB label alone",
@@ -302,6 +319,89 @@ check("the warning is translated too",
       "हवा बहुत खराब हो सकती है" in hi_loud.text, True)
 check("and carries no percent either",
       bool(re.search(r"\d+\s*%", hi_loud.text)), False)
+print()
+
+
+print("The cleanest/worst time block — three states, and they must not blur:")
+# The gate itself, checked before anything that depends on it. Without this the
+# two fixtures below could sit on the same side of MIN_SPREAD and every check
+# after it would pass while testing one branch twice.
+check(f"MIN_SPREAD={MIN_SPREAD:.0f} really separates the two fixtures",
+      LEVEL[2] < MIN_SPREAD <= SHAPED[2], True)
+# The block ranks four windows off the station's own trailing 7 days. It is NOT
+# the model: the model refuses every morning because OpenAQ publishes 5-11h
+# late, and this needs no fresh reading at all.
+named = compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0,
+                window=SHAPED)
+level = compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0,
+                window=LEVEL)
+absent = compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0)
+
+check("a pronounced day names the cleanest window, with its hours",
+      "Cleanest time today: <b>morning, 6 AM to 11 AM</b>" in named.text, True)
+check("and the worst one, which is the half a parent acts on",
+      "Worst time today: evening, 4 PM to 9 PM" in named.text, True)
+# 41.6% right on a four-way choice is not a forecast, and dressing it as one
+# would claim skill the probe never measured.
+check("no percent, no 'chance', no forecast language",
+      bool(re.search(r"\d+\s*%|chance|probabilit|forecast|predict",
+                     named.text, re.I)), False)
+
+check("a level day says so instead of naming a window",
+      "stays about the same all day" in level.text, True)
+check("and names neither end", "Cleanest time today" in level.text, False)
+
+# The state that must never be confused with a level day. No shape at all means
+# a sensor too thin to rank, and reporting that as "the air is level" would be
+# inventing calm weather out of missing data.
+check("no shape at all produces NO block, not a level line",
+      ("Cleanest time today" in absent.text
+       or "stays about the same" in absent.text), False)
+check("and the message is otherwise byte-identical to the old one",
+      absent.text,
+      compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0,
+              window=None).text)
+
+# Ordering is only meaningful inside ONE rendered message, so both positions
+# are read off the same text. Comparing an index in one message against an index
+# in another is how the first version of this check passed for nothing.
+both = compose("S", readings, OBS, at(2.0), PROFILE, pm25_ugm3=72.0,
+               window=SHAPED, warn_target=EVENING)
+check("the block sits below the model's warning, not above it",
+      both.text.index("Cleanest time today")
+      > both.text.index("likely to get very bad"), True)
+check("and above the government AQI, which covers a different window",
+      named.text.index("Cleanest time today")
+      < named.text.index("Government AQI"), True)
+# Two bands already fight for the reader's attention; a third emoji-led line
+# would make it three. The block is deliberately plain text.
+check("it adds no emoji-led line",
+      sum(1 for ln in named.text.split("\n")
+          if ln.startswith(("🟢", "🟡", "🟠", "🔴", "🟣", "⚫"))), 1)
+
+hi_named = compose("S", readings, OBS, at(2.0), "दमे वाला बच्चा",
+                   pm25_ugm3=72.0, window=SHAPED, lang="hi")
+check("the window names are translated — they are OUR words, not CPCB's",
+      "आज सबसे साफ़ समय: <b>सुबह, 6 से 11 बजे</b>" in hi_named.text, True)
+# Keyed off the band this fixture actually produced, so the check cannot pass
+# by naming a band the message never reached.
+check("and CPCB's health sentence is still verbatim English beside them",
+      ADVISORY[hi_named.band] in hi_named.text, True)
+check("the level line is translated too",
+      "पूरे दिन लगभग एक जैसी रहती है" in
+      compose("S", readings, OBS, at(2.0), "दमे वाला बच्चा", pm25_ugm3=72.0,
+              window=LEVEL, lang="hi").text, True)
+
+# The labels claim specific hours. If they drifted from the windows the ranking
+# is computed over, every message would be quietly wrong about when to go out —
+# a mismatch that crashes nothing and shows up nowhere else.
+check("every window the ranking can return has a label in both languages",
+      {lang: sorted(WINDOW_NAMES[lang]) for lang in LANGS},
+      {lang: sorted(dict(wshape_windows)) for lang in LANGS})
+check("and the labels' hours match the windows themselves",
+      [(name, hours[0], hours[-1]) for name, hours in wshape_windows],
+      [("morning", 6, 10), ("afternoon", 11, 15),
+       ("evening", 16, 20), ("night", 21, 5)])
 print()
 
 

@@ -67,6 +67,25 @@ MIN_READINGS = 3
 MIN_LIFT = 0.10
 CHANCE = 1.0 / len(WINDOWS)
 
+# How far apart the four windows have to sit, in µg/m³, before the 07:00 message
+# names them at all. Read off the by_spread table below rather than tuned, so it
+# is a choice made ON a measurement and not itself one — same standing as
+# retrain.MIN_MARGIN. `[measured 2026-08-24: probe_window_shape.py, N=7, 6,900
+# station-days, split by the spread of the shape we would show]`
+#
+#   gate  days shown   cleanest window right
+#   10       69%           46.1%
+#   25       37%           51.8%
+#   50       17%           59.5%
+#   (none)  100%           40.8%   — chance is 25.0%
+#
+# 25 is the pick: a flat pattern scores 31.4%, barely over chance, and a block
+# that speaks every morning while being right half the time teaches people to
+# skip it — and then they skip the staleness warning too. Same reasoning as
+# STALE_AFTER_H. Below this the message says the day is level instead of naming
+# a window, which is a different sentence from saying nothing.
+MIN_SPREAD = 25.0
+
 
 def bucket(series: dict[int, dict[int, float]]
            ) -> dict[int, dict[object, dict[str, list[float]]]]:
@@ -121,6 +140,23 @@ def shape_over(days: dict[object, dict[str, list[float]]], window: list
     return medians(pooled)
 
 
+def rank(shape: dict[str, float]) -> tuple[str, str, float]:
+    """(cleanest, worst, spread) for one shape.
+
+    One expression for the ranking, called by the scoring below AND by
+    send_alerts.window_shapes, so the block that ships and the block these
+    tables score cannot drift apart. If they could, the hit rates stop
+    describing the product.
+
+    Ties break on WINDOWS order, which is chronological — on a genuinely flat
+    day that names the morning. Harmless, because MIN_SPREAD refuses to print a
+    window name on such a day at all.
+    """
+    return (min(NAMES, key=lambda k: shape[k]),
+            max(NAMES, key=lambda k: shape[k]),
+            max(shape.values()) - min(shape.values()))
+
+
 def sweep(buckets) -> dict[int, tuple[int, int, int]]:
     """{N: (days_scored, cleanest_hits, worst_hits)}.
 
@@ -135,17 +171,17 @@ def sweep(buckets) -> dict[int, tuple[int, int, int]]:
             truth = medians(days[day])
             if truth is None:
                 continue
-            best_true = min(NAMES, key=lambda k: truth[k])
-            worst_true = max(NAMES, key=lambda k: truth[k])
+            best_true, worst_true, _ = rank(truth)
             for n in SWEEP:
                 prior = [day - timedelta(days=i) for i in range(1, n + 1)]
                 shape = shape_over(days, prior)
                 if shape is None:
                     continue
+                best_shape, worst_shape, _ = rank(shape)
                 row = tally[n]
                 row[0] += 1
-                row[1] += min(NAMES, key=lambda k: shape[k]) == best_true
-                row[2] += max(NAMES, key=lambda k: shape[k]) == worst_true
+                row[1] += best_shape == best_true
+                row[2] += worst_shape == worst_true
     return {n: tuple(v) for n, v in tally.items()}
 
 
@@ -256,6 +292,40 @@ def self_test() -> int:
     else:
         print("  PASS  the four windows cover all 24 hours, no overlap")
 
+    # 6. rank() is what send_alerts prints, so it is checked here rather than
+    #    only through the hit rates it feeds. A shaped day must name both ends.
+    shaped = {"morning": 20.0, "afternoon": 60.0,
+              "evening": 200.0, "night": 90.0}
+    got = rank(shaped)
+    if got != ("morning", "evening", 180.0):
+        failures.append(f"rank() misread a shaped day: {got}")
+    else:
+        print("  PASS  rank() names both ends of a shaped day")
+
+    # 7. The gate, driven from both sides. A level day must fall under
+    #    MIN_SPREAD and a pronounced one must clear it — otherwise the message
+    #    either never names a window or always does, and neither shows up in a
+    #    hit rate.
+    level = {"morning": 51.0, "afternoon": 55.0,
+             "evening": 58.0, "night": 53.0}
+    if rank(level)[2] >= MIN_SPREAD:
+        failures.append("a level day cleared MIN_SPREAD")
+    elif rank(shaped)[2] < MIN_SPREAD:
+        failures.append("a pronounced day did not clear MIN_SPREAD")
+    else:
+        print(f"  PASS  MIN_SPREAD={MIN_SPREAD:.0f} splits level from "
+              f"pronounced")
+
+    # 8. A window short of MIN_READINGS yields no shape at all. That is the
+    #    third state the message has — silence, which must not read as "the day
+    #    is level". A dead sensor and a flat day are not the same news.
+    thin = {name: [40.0] * MIN_READINGS for name in NAMES}
+    thin["evening"] = [40.0] * (MIN_READINGS - 1)
+    if medians(thin) is not None:
+        failures.append("a window under MIN_READINGS still produced a median")
+    else:
+        print("  PASS  a thin window produces no shape, not a level day")
+
     for f in failures:
         print(f"  FAIL  {f}", file=sys.stderr)
     return 1 if failures else 0
@@ -291,12 +361,12 @@ def by_spread(buckets, n: int, on: str = "shape",
                                       for i in range(1, n + 1)])
             if shape is None:
                 continue
-            source = shape if on == "shape" else truth
-            spread = max(source.values()) - min(source.values())
+            best_shape, _, spread_shape = rank(shape)
+            best_true, _, spread_true = rank(truth)
+            spread = spread_shape if on == "shape" else spread_true
             edge = max(e for e in edges if spread >= e)
             bands[edge][0] += 1
-            bands[edge][1] += (min(NAMES, key=lambda k: shape[k])
-                               == min(NAMES, key=lambda k: truth[k]))
+            bands[edge][1] += best_shape == best_true
     return [(e, bands[e][0], bands[e][1]) for e in edges]
 
 
