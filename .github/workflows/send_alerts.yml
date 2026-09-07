@@ -1,4 +1,4 @@
-# The Phase 2 daily alert. One message per subscriber, once a day, 07:00 IST.
+# The Phase 2 daily alert. One message per subscriber, once a day, 05:00 IST.
 #
 # Unlike ingest.yml, a missed run here is recoverable in principle — the reading
 # still exists tomorrow — but it is not recoverable in practice: yesterday's air
@@ -7,13 +7,26 @@
 name: send_alerts
 
 on:
-  # 01:30 UTC is 07:00 IST. The hour is not arbitrary and not remembered: CPCB's
-  # feed freezes every morning, so the last bulletin before this is 05:00 IST and
-  # the next is between 10:00 and 13:00. At 07:00 the reading is 2.0h old; at
-  # 09:00 it is 4.0h and every message would carry a staleness warning, every
-  # day, which teaches people to ignore warnings. scripts/check_send_window.py
-  # re-measures that window on this same schedule and fails when 07:00 stops
-  # clearing the 3h rule, naming the replacement hour.
+  # 23:30 UTC is 05:00 IST the following day. The hour is not arbitrary and not
+  # remembered: CPCB's feed freezes every morning, so the last bulletin before
+  # this is 05:00 IST and the next is between 10:00 and 13:00. Later in the
+  # morning the reading only ages — at 09:00 it is 4.0h old and every message
+  # would carry a staleness warning, every day, which teaches people to ignore
+  # warnings. scripts/check_send_window.py re-measures the window on this same
+  # schedule and fails when the send hour stops clearing the 3h rule.
+  #
+  # Moved 07:00 -> 05:00 on 2026-09-07. 07:00 is 2.0h old on 13 of 14 days and
+  # was 5.0h on one (2026-08-26, when the freeze began at 02:00 IST instead of
+  # 05:00); 05:00 is 0.0h on those same 13 days and 3.0h on the bad one
+  # [measured 2026-09-07: bulletin ages per IST day over 14 days of
+  # observations]. So the move is never worse and usually two hours fresher. It
+  # costs no reader anything — a Telegram message waits in the chat, so someone
+  # waking at 07:00 reads a 05:00 send at 07:00 either way.
+  #
+  # It does NOT make this robust: on 2026-08-26 05:00 sat at exactly the 3.0h
+  # limit, so a worse morning fails here too. Do not raise the threshold when
+  # that happens — read the per-day ages first and find out whether CPCB's
+  # freeze has genuinely shifted or one outlier is failing a worst-case check.
   #
   # This is the BACKUP trigger, exactly as in ingest.yml. GitHub delivered 11 of
   # ~36 requested ticks over 18 hours on this repo, all 15-22 minutes late. The
@@ -22,10 +35,13 @@ on:
   # UNIQUE (chat_id, send_date) and the check above it make the second one a
   # no-op rather than a second message.
   #
-  # Changing this cron means changing SEND_HOUR in scripts/check_send_window.py
-  # too — this one is UTC, that one is IST.
+  # Changing this cron means changing, together: SEND_HOUR in
+  # scripts/check_send_window.py (IST), the matching string in
+  # trigger/wrangler.toml and trigger/src/index.js (which must agree character
+  # for character), classify.SEND_HOUR_IST and probe_cpcb_signal.SEND_HOUR_UTC
+  # (both select the send hour's rows for re-measurement). This one is UTC.
   schedule:
-    - cron: '30 1 * * *'
+    - cron: '30 23 * * *'
 
   workflow_dispatch:
     inputs:

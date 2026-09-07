@@ -58,7 +58,9 @@ enabled = true
 # from H+0:32 to H+1:04, so a single fixed poll can sit in the wrong half of that
 # drift and miss one entirely.
 #
-# The second cron is Phase 2's daily alert at 01:30 UTC = 07:00 IST, dispatching
+# The second cron is Phase 2's daily alert at 23:30 UTC = 05:00 IST the next
+# day (moved from 01:30 UTC / 07:00 IST on 2026-09-07; send_alerts.yml carries
+# the per-day measurement that justifies it), dispatching
 # send_alerts.yml instead of ingest.yml. src/index.js maps cron -> workflow by
 # the exact string, so these two files have to agree character for character.
 #
@@ -90,4 +92,4 @@ enabled = true
 # run inside the same month tests the incumbent on rows it was refit on, which
 # retrain.py detects and refuses to score rather than answering wrongly.
 # .github/workflows/retrain.yml carries the full reasoning.
-crons = ["5,35 * * * *", "30 1 * * *", "0 2,3,4 * * 2", "0 3 1 * *"]
+crons = ["5,35 * * * *", "30 23 * * *", "0 2,3,4 * * 2", "0 3 1 * *"]

@@ -272,10 +272,17 @@ def fit_tuned(name: str, Xtr, ytr, both, yin, n_inner: int, threshold: float,
 # bucket half the time; the reading is really 19:30 UTC = 01:00 IST. So the
 # offset is +5:30 for the timezone plus the +0:30 the flooring removed.
 #
-# Consequence worth stating plainly: the 07:00 IST send is `hour % 24 == 1`,
-# which is 01:30 UTC — the same value send_alerts.yml's cron carries.
+# Consequence worth stating plainly: the 05:00 IST send is `hour % 24 == 23`,
+# which is 23:30 UTC — the same value send_alerts.yml's cron carries.
 IST_OFFSET_HOURS = 6
-SEND_HOUR_IST = 7
+
+# The hour the product issues at, which is what --breakdown regroups on. 7 until
+# the send moved to 05:00 IST on 2026-09-07; every 07:00 row in CLAUDE.md's
+# tables was measured against the old hour and is not restated by changing this.
+# 05:00 + 12h targets 17:00 IST rather than 19:00, so the October --stale re-run
+# scores a different evening than the August one did — compare it against a
+# fresh 05:00 control, never against the stored 07:00 numbers.
+SEND_HOUR_IST = 5
 
 # Where the per-station table is split for reporting. Station base rates span
 # 1.1% to 43.4% at 12h — a factor of 40 — so one averaged margin over all 30 is
@@ -716,14 +723,14 @@ def self_test() -> int:
     ok = ok and csi == 1.0
 
     # The IST mapping the breakdown groups by. Checked against a stamp whose
-    # answer is known independently: send_alerts.yml's cron is 01:30 UTC and the
-    # send is 07:00 IST, so epoch hour 1 must map to 7. The naive route —
-    # tz_convert on the floored hour — answers 6, half an hour early, and would
+    # answer is known independently: send_alerts.yml's cron is 23:30 UTC and the
+    # send is 05:00 IST, so epoch hour 23 must map to 5. The naive route —
+    # tz_convert on the floored hour — answers 4, half an hour early, and would
     # put the send in the wrong bucket silently.
-    known = features.EPOCH + pd.Timedelta(hours=1)
+    known = features.EPOCH + pd.Timedelta(hours=23)
     naive = known.tz_convert("Asia/Kolkata").hour
-    got = int(ist_hour(1))
-    print(f"  IST mapping     : epoch hour 1 -> {got:02d}:00 IST "
+    got = int(ist_hour(23))
+    print(f"  IST mapping     : epoch hour 23 -> {got:02d}:00 IST "
           f"(naive tz_convert on the floored hour says {naive:02d}, which is "
           f"the trap)")
     ok = ok and got == SEND_HOUR_IST and naive != SEND_HOUR_IST

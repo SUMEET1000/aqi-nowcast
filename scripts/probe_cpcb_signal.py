@@ -60,9 +60,10 @@ EVENT_ABOVE = 121.0          # CPCB's Very Poor band
 # same rival. OpenAQ was ~6.5h behind for 27 of 30 stations on 2026-08-22.
 STALE_H = 7
 
-# 01:30 UTC is the send. The cron in send_alerts.yml is `30 1 * * *`, and every
-# bulletin is stamped at :30 past the UTC hour.
-SEND_HOUR_UTC = 1
+# 23:30 UTC is the send. The cron in send_alerts.yml is `30 23 * * *`, and every
+# bulletin is stamped at :30 past the UTC hour. It was `30 1` (07:00 IST) until
+# 2026-09-07, so this probe's stored numbers were measured at the old hour.
+SEND_HOUR_UTC = 23
 
 # Below this the probe reaches no verdict. A rank comparison decided by forty
 # events is decided by which two bad evenings fell inside 13 days — the same

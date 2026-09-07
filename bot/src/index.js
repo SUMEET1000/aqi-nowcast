@@ -57,7 +57,7 @@ const T = {
       "via data.gov.in.",
     welcome:
       "🌬️ <b>Vayu — Haryana Air Alert</b>\n\n" +
-      "Every morning at 7:00 AM you get one message: how dirty the air is " +
+      "Every morning at 5:00 AM you get one message: how dirty the air is " +
       "where you live, and what the government says about it.\n\n" +
       "That is all. Nothing to open, nothing to pay.",
     pickPlace: "👇 <b>Pick your place</b> ({live} of {total} working right now):",
@@ -71,7 +71,7 @@ const T = {
     subscribed:
       "✅ <b>All set — {name}</b>\n\n" +
       "Today's reading is coming in a minute or two.\n\n" +
-      "After that: one message every morning at 7:00 AM.\n\n" +
+      "After that: one message every morning at 5:00 AM.\n\n" +
       "🔄 /stations — change place ({day} a day, {week} a week)\n" +
       "🌐 /language — English / हिंदी\n" +
       "⏸ /pause — stop the daily message\n" +
@@ -79,16 +79,16 @@ const T = {
     samePopup: "Already on this one",
     same:
       "You are already set for <b>{name}</b>. Nothing changed.\n\n" +
-      "Your next message comes at 7:00 AM.",
+      "Your next message comes at 5:00 AM.",
     cappedPopup: "Changed — but no reading right now",
     capped:
       "🔄 Changed to <b>{name}</b>.\n\n" +
       "You can change place {day} times a day and {week} times a week. You " +
       "have used them up, so today's reading is not being fetched right now.\n\n" +
-      "Your next message comes at 7:00 AM for <b>{name}</b>.",
+      "Your next message comes at 5:00 AM for <b>{name}</b>.",
     about:
       "<b>🌬️ What this bot does</b>\n" +
-      "Once a day, at 7:00 AM, it tells you how dirty the air is where you " +
+      "Once a day, at 5:00 AM, it tells you how dirty the air is where you " +
       "live — so you can decide about going out, sending a child to play, or " +
       "wearing a mask.\n\n" +
       "<b>🔢 The two numbers</b>\n" +
@@ -136,7 +136,7 @@ const T = {
       "डेटा: Central Pollution Control Board, data.gov.in से।",
     welcome:
       "🌬️ <b>वायु — हरियाणा हवा अलर्ट</b>\n\n" +
-      "हर सुबह 7:00 बजे एक संदेश: आपके इलाके की हवा कितनी गंदी है, और सरकार " +
+      "हर सुबह 5:00 बजे एक संदेश: आपके इलाके की हवा कितनी गंदी है, और सरकार " +
       "उसके बारे में क्या कहती है।\n\n" +
       "बस इतना ही। कुछ खोलना नहीं, कुछ देना नहीं।",
     pickPlace: "👇 <b>अपनी जगह चुनें</b> ({total} में से {live} अभी चालू हैं):",
@@ -150,7 +150,7 @@ const T = {
     subscribed:
       "✅ <b>सब तैयार — {name}</b>\n\n" +
       "आज की रीडिंग एक-दो मिनट में आ रही है।\n\n" +
-      "उसके बाद: हर सुबह 7:00 बजे एक संदेश।\n\n" +
+      "उसके बाद: हर सुबह 5:00 बजे एक संदेश।\n\n" +
       "🔄 /stations — जगह बदलें (दिन में {day} बार, हफ़्ते में {week})\n" +
       "🌐 /language — English / हिंदी\n" +
       "⏸ /pause — रोज़ का संदेश बंद करें\n" +
@@ -158,16 +158,16 @@ const T = {
     samePopup: "यह पहले से चुनी है",
     same:
       "आप पहले से <b>{name}</b> पर हैं। कुछ नहीं बदला।\n\n" +
-      "अगला संदेश सुबह 7:00 बजे आएगा।",
+      "अगला संदेश सुबह 5:00 बजे आएगा।",
     cappedPopup: "बदल गई — पर अभी रीडिंग नहीं",
     capped:
       "🔄 बदलकर <b>{name}</b> कर दी गई।\n\n" +
       "जगह दिन में {day} बार और हफ़्ते में {week} बार बदल सकते हैं। वे पूरे हो " +
       "गए हैं, इसलिए आज की रीडिंग अभी नहीं मँगाई जा रही।\n\n" +
-      "अगला संदेश सुबह 7:00 बजे <b>{name}</b> के लिए आएगा।",
+      "अगला संदेश सुबह 5:00 बजे <b>{name}</b> के लिए आएगा।",
     about:
       "<b>🌬️ यह बॉट क्या करता है</b>\n" +
-      "दिन में एक बार, सुबह 7:00 बजे, यह बताता है कि आपके इलाके की हवा कितनी " +
+      "दिन में एक बार, सुबह 5:00 बजे, यह बताता है कि आपके इलाके की हवा कितनी " +
       "गंदी है — ताकि आप तय कर सकें कि बाहर जाना है, बच्चे को खेलने भेजना है, " +
       "या मास्क पहनना है।\n\n" +
       "<b>🔢 दो नंबर</b>\n" +

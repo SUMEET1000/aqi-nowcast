@@ -1,4 +1,4 @@
-"""Is 07:00 IST still a send time that produces a fresh reading?
+"""Is 05:00 IST still a send time that produces a fresh reading?
 
     python scripts/check_send_window.py
     python scripts/check_send_window.py --max-age-hours 1.5   # force a failure
@@ -35,12 +35,20 @@ MAX_AGE_H = 3.0
 
 # The configured send time, in IST. Change this and .github/workflows/
 # send_alerts.yml's cron together — the cron is in UTC.
-SEND_HOUR = 7
+#
+# 7 until 2026-09-07. It was moved because this check failed on a worst-case
+# age of 5.0h at 07:00 — driven by ONE morning in 14 (2026-08-26), not by a
+# shifted CPCB schedule. Read the per-day ages before acting on a failure here:
+# this reports the worst day, so a single outlier fails a hour that is fine on
+# the other thirteen.
+SEND_HOUR = 5
 
 # Candidate hours to report on. Bounded by CPCB's freeze: 05:00 is the last
 # morning bulletin and nothing new arrives before 10:00, so hours outside this
-# span answer no question anyone is asking.
-CANDIDATE_HOURS = range(5, 13)
+# span answer no question anyone is asking. It starts AT the configured send
+# hour — a table that cannot show the hour it is judging would report a FAIL
+# with no row for the thing that failed.
+CANDIDATE_HOURS = range(SEND_HOUR, 13)
 
 WINDOW_DAYS = 14
 

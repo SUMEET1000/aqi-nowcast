@@ -1,4 +1,4 @@
-"""The daily alert. One message per subscriber, once a day, at 07:00 IST.
+"""The daily alert. One message per subscriber, once a day, at 05:00 IST.
 
     python scripts/send_alerts.py --dry-run          # render, send nothing
     python scripts/send_alerts.py --dry-run --station 21
@@ -15,14 +15,16 @@ alert on a *current* reading only restates what is already out of the window.
 What makes an alert useful is firing before the bad air arrives, and that needs
 Phase 4. profiles.threshold_pm25 and cooldown_hours exist and are unused.
 
-Why 07:00 IST: CPCB's feed freezes every morning. Measured over four days, the
-last morning bulletin is 05:00 IST and the next is between 10:00 and 13:00, so
-at 07:00 the reading is 2.0h old, at 08:00 exactly 3.0h, at 09:00 4.0h — and
-build plan §5 requires the message to say so past 3h. A staleness warning that
-fires every single day teaches people to ignore warnings, which then hides the
-real one. scripts/check_send_window.py re-measures that window and fails when
-07:00 stops clearing the threshold, so the constant is checked rather than
-remembered.
+Why 05:00 IST: CPCB's feed freezes every morning. The last morning bulletin is
+05:00 IST and the next is between 10:00 and 13:00, so the reading only ages
+through the morning — at 09:00 it is 4.0h old, and build plan §5 requires the
+message to say so past 3h. A staleness warning that fires every single day
+teaches people to ignore warnings, which then hides the real one.
+scripts/check_send_window.py re-measures that window and fails when the send
+hour stops clearing the threshold, so the constant is checked rather than
+remembered — and it did, on 2026-09-07, moving this from 07:00 to 05:00.
+The message waits in the chat either way, so an earlier send costs no reader
+anything and lands two hours fresher.
 
 Degrades per subscriber and exits non-zero afterwards, the same shape as
 ingest.py: one person's dead chat must not cost everyone else their message.
@@ -377,9 +379,9 @@ def compose(station_name: str, readings: dict[str, float | None],
     def ist(ts: datetime) -> str:
         return ts.astimezone(IST).strftime("%I:%M %p").lstrip("0")
 
-    # Staleness is judged on the freshest thing we are showing. At 07:00 IST
-    # that is normally OpenAQ's 07:00 reading rather than CPCB's 05:00 bulletin,
-    # which is what stops the 3h warning firing every single morning.
+    # Staleness is judged on the freshest thing we are showing. At the send
+    # hour that is normally OpenAQ's reading rather than CPCB's bulletin, which
+    # is what stops the 3h warning firing every single morning.
     headline_ts = concentration_ts or observation_ts
     age_h = (now - headline_ts).total_seconds() / 3600
     reading_time = ist(headline_ts)
@@ -519,7 +521,7 @@ def concentrations(conn, station_ids: list[int]
                    ) -> dict[int, tuple[datetime, float] | None]:
     """Newest measured PM2.5 in µg/m³ per station, from pm25_history (OpenAQ).
 
-    The real concentration, and at 07:00 IST usually the fresher of our two
+    The real concentration, and at the send hour usually the fresher of our two
     sources — CPCB's feed is frozen between 05:00 and about 11:00 IST while
     OpenAQ keeps publishing. Separate from readings_at because the two are
     different quantities from different feeds on different timestamps, and
@@ -547,7 +549,7 @@ def concentrations(conn, station_ids: list[int]
 
 LOOKBACK_DAYS = 7
 
-# Whole IST days only. Today is in progress at 07:00 and its shape would be
+# Whole IST days only. Today is in progress at the send hour and its shape is
 # three-quarters missing, and bucket() would then reject the day for falling
 # under MIN_READINGS anyway — asking for it just moves the rejection later.
 # +1 covers the partial day at each end of the UTC/IST offset.

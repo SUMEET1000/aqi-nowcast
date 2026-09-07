@@ -24,7 +24,7 @@ const REPO = "aqi-nowcast";
 // with no drift verdict, and the season is about six weeks long.
 const WORKFLOWS = {
   "5,35 * * * *": "ingest.yml",
-  "30 1 * * *": "send_alerts.yml", // 07:00 IST
+  "30 23 * * *": "send_alerts.yml", // 05:00 IST the following day
   "0 2,3,4 * * 2": "monitor.yml", // Tuesday, after the scored week's data lands
   "0 3 1 * *": "retrain.yml", // 1st of the month, the promotion gate
 };
