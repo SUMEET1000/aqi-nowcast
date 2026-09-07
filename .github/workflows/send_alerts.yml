@@ -53,7 +53,7 @@ on:
       #
       # The cost is the forecast line, which forecast.outlook() refuses every
       # morning anyway. Once the October --stale 7 re-run clears and the line
-      # starts rendering, a fast run omits it and the 07:00 message does not.
+      # starts rendering, a fast run omits it and the daily message does not.
       fast:
         description: "Skip model deps and the send-window check"
         type: boolean
@@ -149,8 +149,10 @@ jobs:
       # would turn a scheduling drift into a day of silence.
       #
       # `if: always()` so it still runs when the send failed: "did anyone get a
-      # message" and "is 07:00 still the right hour" are independent questions.
-      - name: Is 07:00 IST still fresh?
+      # message" and "is the send hour still right" are independent questions.
+      # The name carries no hour: it went stale the moment the send moved, and a
+      # step whose label disagrees with what it checks is read as the truth.
+      - name: Is the send hour still fresh?
         if: ${{ always() && !inputs.fast }}
         env:
           PYTHONUNBUFFERED: "1"
