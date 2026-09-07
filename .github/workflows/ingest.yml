@@ -170,14 +170,24 @@ jobs:
       #
       # After Ingest, not before: CPCB's bulletin is the unrecoverable one, and
       # a failure here must not cost it. OpenAQ is an archive that is still
-      # there on the next run, which is also why a two-day window rather than
+      # there on the next run, which is also why a window of days rather than
       # one hour — a missed run heals itself instead of leaving a hole.
+      #
+      # The window must stay WIDER THAN OPENAQ'S PUBLISHING LAG, or every run
+      # asks for hours that do not exist yet and backfill_station raises
+      # "requested window is outside sensor coverage" for all 30 stations. Two
+      # days was wide enough while the lag was ~7h; the lag reached ~4 days by
+      # 2026-09-07 and the step then failed on every run from 09-02, leaving
+      # pm25_history five days behind and reading as a dead pipeline. It cannot
+      # heal itself: the window slides forward faster than the data arrives.
+      # 7 costs ~5.5s per station, ~3 min for 30, against timeout-minutes: 20
+      # [measured 2026-09-07: backfill_openaq.py --station 15 --since 2026-08-31].
       - name: Pull OpenAQ hourly PM2.5
         env:
           PYTHONUNBUFFERED: "1"
           OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/backfill_openaq.py --since "$(date -u -d '2 days ago' +%F)"
+        run: python scripts/backfill_openaq.py --since "$(date -u -d '7 days ago' +%F)"
 
 # Two GitHub behaviours worth designing around rather than discovering later.
 # GitHub disables scheduled workflows on a repository with 60 days of no
