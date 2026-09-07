@@ -227,6 +227,18 @@ check("the age is always stated, alarm or not",
 check("and the quiet line says why a reading is hours old",
       "reach us a few hours late" in compose("S", readings, OBS, at(under),
                                              PROFILE).text, True)
+# The alarm must not diagnose. A dead sensor and an archive running late are
+# indistinguishable from anything this function can see, and for four days in
+# September 2026 the message told all 30 stations' subscribers their sensor had
+# stopped when the real cause was OpenAQ publishing ~4 days behind. Both causes
+# named, neither asserted.
+alarm = compose("S", readings, OBS, at(over), PROFILE).text
+check("the alarm names the publisher being late as a possible cause",
+      "running behind" in alarm, True)
+check("and the machine stopping as the other one",
+      "machine here has stopped" in alarm, True)
+check("and it says outright that we cannot tell which",
+      "cannot tell which" in alarm, True)
 print()
 
 print("A station name is third-party text and goes through HTML escaping:")

@@ -60,6 +60,16 @@ from ingest import annotate, clean_detail, step_summary
 # every day, so nothing is hidden.
 STALE_AFTER_H = 12.0
 
+# The alarm above this threshold names TWO possible causes and picks neither,
+# because nothing here can tell them apart: a dead sensor and an archive running
+# late produce the identical absence. It said "the sensor here may have stopped"
+# until 2026-09-07, when OpenAQ's own publishing lag reached ~4 days and every
+# subscriber was told their sensor was broken, every morning
+# [measured 2026-09-07: all 30 stations 92.8h-101.8h behind in pm25_history].
+# The number was never wrong and the age was always printed; the diagnosis was.
+# Raising this constant to quiet it is the move every other gate here forbids —
+# it would present a four-day-old reading as current.
+
 # fetch_log outcomes owned by this script. Deliberately outside
 # gate1_check.RUN_OUTCOMES and ANOMALY_OUTCOMES, which are explicit whitelists —
 # so the sender is observable in the same table without inflating or deflating
@@ -173,7 +183,10 @@ TEXT = {
         "age":       ("This reading is {h} hours old. Readings always reach "
                       "us a few hours late — this is normal."),
         "stale":     ("⚠️ Nothing new since {t} — {h} hours ago. That is much "
-                      "later than usual. The sensor here may have stopped."),
+                      "later than usual. Either the people who publish this "
+                      "data are running behind, or the machine here has "
+                      "stopped. We cannot tell which. Treat this number as "
+                      "old."),
         "win_clean": "Cleanest time today: <b>{w}</b>",
         "win_worst": "Worst time today: {w}",
         "win_level": "The air here stays about the same all day.",
@@ -203,7 +216,9 @@ TEXT = {
         "age":       ("यह रीडिंग {h} घंटे पुरानी है। रीडिंग हमेशा कुछ घंटे "
                       "देर से पहुँचती है — यह आम बात है।"),
         "stale":     ("⚠️ {t} के बाद कुछ नया नहीं आया — {h} घंटे पहले। यह आम से "
-                      "काफ़ी ज़्यादा देर है। यहाँ की मशीन बंद हो सकती है।"),
+                      "काफ़ी ज़्यादा देर है। या तो यह डेटा देने वाले पीछे चल रहे "
+                      "हैं, या यहाँ की मशीन बंद हो गई है। हम बता नहीं सकते कि "
+                      "क्या हुआ। इस नंबर को पुराना मानें।"),
         "win_clean": "आज सबसे साफ़ समय: <b>{w}</b>",
         "win_worst": "आज सबसे खराब समय: {w}",
         "win_level": "यहाँ की हवा पूरे दिन लगभग एक जैसी रहती है।",
