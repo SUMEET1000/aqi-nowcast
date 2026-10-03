@@ -15,14 +15,22 @@ with the baseline table below — written *before* any model existed, so the goa
 quietly move — and Phase 4's on the same day.
 
 **A model does beat the baseline at warning people, at the one horizon the product needs. It is
-wired into the message and it is switched off, because the air readings arrive about six and a
-half hours late and the win does not survive that.** The forecast is written, tested, deployed,
+wired into the message and it is switched off, because the air readings arrive late and the
+measured win does not survive stale inputs.** The forecast is written, tested, deployed,
 and refuses to speak rather than issue a five-hour forecast wearing a twelve-hour label. Every
 number is in [The model, and why it is not switched on](#the-model-and-why-it-is-not-switched-on).
 
 Phase 5 is running: weekly drift and staleness monitoring since 2026-08-21, and a monthly
 retrain with a promotion gate since 2026-08-22. Its gate — a dated post-mortem of a real drift
-incident — cannot be written until the stubble-burning season shifts the data in October.
+incident — remains open until a real seasonal shift and its effect on the model are measured.
+
+**Operational status, 4 October 2026:** OpenAQ history recovered to **219,495 rows**,
+including **834 October rows across 29 stations**. CPCB's live endpoint remains unreachable,
+so the live-feed collection gate still fails. OpenAQ collection now succeeds independently,
+but its newest available hour is **36.2 hours old**, exceeding the unchanged 36-hour
+monitoring limit. Old readings carry dates, and stale government AQI and health notes are
+withheld. [measured 2026-10-04 IST: scheduled run 37147100274 and database checks;
+details and remaining limits](docs/collection-recovery.md)
 
 ---
 
@@ -35,7 +43,7 @@ incident — cannot be written until the stubble-burning season shifts the data 
 | 2 | Telegram bot, **no model** | 3 real users, 1 feedback row | ✅ 2026-08-14 |
 | 3 | Baselines: persistence, seasonal, climatology | per-horizon table in this README | ✅ 2026-08-20 |
 | 4 | The model — benchmarked, not assumed | beats persistence, or a documented negative | ✅ 2026-08-20 |
-| 5 | Production discipline: drift, retraining, post-mortem | a dated real incident write-up | 🔨 built, waiting on October |
+| 5 | Production discipline: drift, retraining, post-mortem | a dated real incident write-up | 🔨 built; collection degraded, seasonal gate open |
 
 Shipping the bot before the model (Phase 2 before Phase 4) is intentional. It forces the
 distribution problem to the front while it can still change decisions.
@@ -58,7 +66,7 @@ GitHub Actions cron (:13, :43) ────┘        job                  │  
 
 Phase 2, reading the same database:
 
-Cloudflare Worker cron (01:30 UTC = 07:00 IST)
+Cloudflare Worker cron (23:30 UTC = 05:00 IST next day)
         │  workflow_dispatch
         ▼
 GitHub Actions ─▶ scripts/send_alerts.py ─▶ Telegram ─▶ one message per subscriber
@@ -76,7 +84,7 @@ Telegram ──webhook──▶ Cloudflare Worker (bot/) ───────�
 
 Phase 5, on the same trigger and the same database:
 
-Cloudflare Worker cron (Tue 02:00 UTC) ─▶ scripts/monitor.py  ─▶ drift_log, station_health
+Cloudflare Worker cron (Tue 02:00, 03:00, 04:00 UTC) ─▶ scripts/monitor.py ─▶ drift_log, station_health
         │                                  exit 1 IS the alert
 Cloudflare Worker cron (1st, 03:00 UTC) ▶ scripts/retrain.py  ─▶ model_runs
                                            model + score, stored in the database
@@ -144,7 +152,7 @@ python scripts/seed_profiles.py             # three profiles, idempotent
 python tests/test_aqi.py                    # CPCB's worked examples: 31→51, 45→75, 60→100
 python tests/test_message.py                # the message a person actually reads
 python scripts/send_alerts.py --dry-run     # render every station, send nothing
-python scripts/check_send_window.py         # is 07:00 IST still fresh enough?
+python scripts/check_send_window.py         # is 05:00 IST still fresh enough?
 ```
 
 The chat side is a separate Cloudflare Worker — see [`bot/`](bot/) for the deploy steps and
@@ -168,36 +176,32 @@ the script with `--write-doc`.
 
 ---
 
-## The daily message, and why it goes out at 07:00 IST
+## The daily message, and why it goes out at 05:00 IST
 
 One message per subscriber per day: the measured PM2.5 at their station in µg/m³ and its band,
 CPCB's AQI beside it labelled as the 24-hour index it is, then CPCB's own health statement for
-the **overall** AQI band, quoted and cited. Two numbers from two sources, because they are two
+the **overall** AQI band, quoted and cited when its bulletin is usable. Two numbers from two sources, because they are two
 different quantities over two different windows — saying so is the point.
 
 **The forecast is wired in and silent.** Since 2026-08-22 the sender loads the promoted model
-and adds one line when it expects the evening to cross into Very Poor. At 07:00 IST it never
-does, because no reading is fresh enough to forecast from, and it refuses rather than issue a
+and adds one line when it expects the target hour to cross into Very Poor. It currently refuses
+because no reading is fresh enough to forecast from, rather than issue a
 short forecast under a long label. Two rules hold whenever it does speak: **no percentage
 appears, ever**, since nothing here has checked whether a predicted probability means anything;
 and **"no warning" and "we could not look" produce the same output — no line at all**, so an
 absent warning can never read as reassurance.
 
-The send time is measured, not chosen. **CPCB's feed freezes every morning**: over four days
-the last morning bulletin was 05:00 IST and the next arrived between 10:00 and 13:00, with no
-exceptions. Against the rule that a reading over 3 hours old must be flagged as stale, that
-makes the hour load-bearing:
+The send moved from 07:00 to 05:00 IST on 7 September. The earlier time carried a CPCB
+bulletin age of 0 hours on 13 of 14 measured days and 3 hours on the outlier; 07:00 carried
+2 hours and 5 hours respectively. [measured 2026-09-07: per-day bulletin ages in Neon]
+`scripts/check_send_window.py` keeps its 3-hour limit and now includes missing calendar
+days through today, so an outage cannot pass by disappearing from the sample.
 
-| Send at | Newest bulletin | Age | Result |
-|---|---|---|---|
-| 07:00 IST | 05:00 | 2.0h | clean |
-| 08:00 IST | 05:00 | 3.0h | on the line |
-| 09:00 IST | 05:00 | 4.0h | a staleness warning every single day |
-
-A warning that fires daily teaches people to ignore warnings, which then hides the real one. So
-07:00, and `scripts/check_send_window.py` re-measures the freeze on a rolling window and exits
-non-zero naming a replacement hour if 07:00 ever stops clearing 3 hours. The constant is
-checked, not remembered.
+The message's existing 12-hour staleness limit is separate from the send-window gate and
+the forecast's 3-hour issue-age limit. An older dust reading is labelled as a past reading
+with its date. A government bulletin older than 12 hours supplies neither an AQI score
+nor a health note, even if OpenAQ has a fresher concentration. The sender remains useful
+during an outage without presenting old advice as current.
 
 ### Gate 2, on the day it passed
 
@@ -260,8 +264,10 @@ Four things about this table are worth stating rather than leaving a reader to f
   from after the forecast was issued, which is a leak. At the 24h and 48h horizons it is
   therefore identical to persistence by construction.
 
-One station of thirty is absent: **NISE Gwal Pahari, Gurugram** returns HTTP 408 from OpenAQ's
-hourly archive on every attempt. Live ingestion for it is unaffected.
+One station of thirty is absent from the August scoring set: **NISE Gwal Pahari,
+Gurugram** timed out on those archive pulls. Its bounded requests succeeded during
+the [3 October collection recovery](docs/collection-recovery.md); the August scores
+have not been recomputed with the recovered rows.
 
 ---
 
@@ -500,9 +506,12 @@ is kept, off by default, as the record that it was tried.
 
 ### The measurement that stopped the forecast shipping
 
-Every score above was computed on an air reading from the current hour. **At 07:00 IST the
-service does not have one.** OpenAQ publishes about six and a half hours behind real time, so
-the freshest reading at send time is from roughly midnight.
+Every score above was computed on an air reading from the current hour. **At the former
+07:00 IST send, the service did not have one.** The August measurement found OpenAQ about
+six and a half hours behind real time, so the freshest reading was from roughly midnight.
+That is a historical measurement: after the 3 October recovery, 29 stations' newest
+stored hour was about 32 hours old. [measured 2026-10-03: per-station Neon timestamps]
+The send is now 05:00 IST; a future serving evaluation needs its actual lag and target hour.
 
 That was never tested until the model was already wired into the message. Measured
 **2026-08-22**, `python scripts/classify.py --tail --stale 7`, which withholds the newest seven
@@ -588,8 +597,8 @@ tuned cutoff is the only part of the model's output with a measurement behind it
   is strictly backward, so the conditions requiring it do not hold), and **no significance
   test** — at four folds the standard one's assumptions do not hold, so the fold-to-fold spread
   is the test.
-- One station of thirty, **NISE Gwal Pahari, Gurugram**, has no usable history: OpenAQ's archive
-  returns HTTP 408 on every attempt. Live ingestion for it is unaffected.
+- **NISE Gwal Pahari, Gurugram** was absent from the August scoring set after archive
+  timeouts. Bounded recovery requests now succeed; those historical scores still exclude it.
 
 Exploratory analysis, with the plots and the cleaning evidence, is in
 [`notebooks/01_eda_cleaning.ipynb`](notebooks/01_eda_cleaning.ipynb) and its generated summary
@@ -735,7 +744,8 @@ Stated here rather than discovered by a reader.
 - The headline **PM2.5 in µg/m³ therefore comes from OpenAQ** (`pm25_history`), with CPCB's AQI
   reported beside it and labelled as a 24-hour index. OpenAQ is the fresher source at send
   time: measured 2026-08-19, CPCB's feed is frozen between 05:00 and ~11:00 IST while OpenAQ
-  publishes through 06:00–09:00 IST, which is exactly when the 07:00 alert goes out.
+  published through 06:00–09:00 IST in the August measurement. This does not imply low
+  publishing lag today; the current send is 05:00 IST.
 - A CPCB-comparable AQI needs a 24h window (8h for O₃ and CO) with ≥16h of data across ≥3
   pollutants, so it cannot come from one reading. `scripts/probe_avg_window.py` failed to
   disprove that `avg_value` is already such an average, over 26 bulletins on 2026-08-11, and
@@ -802,7 +812,7 @@ Stated here rather than discovered by a reader.
 - Seasonality cuts both ways: if the alert only matters for eight weeks a year, the pipeline and
   monitoring are what keep producing evidence the rest of the time.
 - **The forecast is deployed and silent, and it stays that way until the input lag is solved.**
-  The measured air readings arrive about six and a half hours late, so at the send hour the
+  The measured air readings arrive late, so at the send hour the
   model would be forecasting from the previous evening. Rather than relax the freshness guard,
   the message goes out exactly as it did before the model existed.
 

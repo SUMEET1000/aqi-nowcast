@@ -253,8 +253,8 @@ def drift_verdict(weeks: list[tuple], i: int) -> tuple[str, float, float]:
 def snapshot(cur, backfill: bool) -> int:
     """Upsert weekly per-station distributions. Returns rows written."""
     # Without --backfill, still rewrite the last 10 weeks rather than only the
-    # current one. OpenAQ backfills late and backfill_openaq.py runs a two-day
-    # window, so a week's numbers keep moving for days after it ends. Rewriting
+    # current one. The collector replays at least seven days for corrections,
+    # so a week's numbers keep moving for days after it ends. Rewriting
     # is free — the upsert is keyed on (week, station).
     since = "1970-01-01" if backfill else \
         (datetime.now(timezone.utc) - timedelta(weeks=10)).date().isoformat()
@@ -407,10 +407,9 @@ def check_stale(cur, now: datetime, dry_run: bool) -> None:
         fail(f"pm25_history is {lag_h:.1f}h behind (limit {MAX_HISTORY_LAG_H}h). "
              f"Its newest hour is {newest:%Y-%m-%d %H:%M} UTC. Every drift "
              f"number above is computed on a series that has stopped "
-             f"advancing. Check the 'Pull OpenAQ hourly PM2.5' step in "
-             f"ingest.yml — it fails every run when OPENAQ_API_KEY is missing "
-             f"from the repository secrets, and the CPCB half still succeeds, "
-             f"so the job stays green-ish while this quietly freezes.")
+             f"advancing. Check the latest OpenAQ sensor coverage and the "
+             f"'Pull OpenAQ hourly PM2.5' step logs in ingest.yml to distinguish "
+             f"a late publisher from a failed collector.")
     else:
         ok(f"pm25_history is {lag_h:.1f}h behind real time")
 
