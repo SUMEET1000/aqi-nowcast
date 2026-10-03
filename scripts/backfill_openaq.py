@@ -3,6 +3,7 @@
     python scripts/backfill_openaq.py                      # every mapped station
     python scripts/backfill_openaq.py --station 1          # just one
     python scripts/backfill_openaq.py --station 1 --since 2026-08-09
+    python scripts/backfill_openaq.py --resume             # scheduled collection
 
 Run the one-station form first, over the window where CPCB and OpenAQ overlap,
 then scripts/compare_sources.py. Until that reaches a verdict we do not know
@@ -24,7 +25,7 @@ mapping this script reads.
 import argparse
 import math
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from db import connect
 from probe_history import (
@@ -66,8 +67,8 @@ WHERE pm25_history.value IS DISTINCT FROM EXCLUDED.value
 # The WHERE is the same trick as ingest.py's upsert: it makes cur.rowcount mean
 # "rows that actually changed", so a re-run reports 0 and proves it was a no-op
 # instead of leaving us to assume it. A re-run reporting a non-zero count over a
-# window already pulled means OpenAQ restated its archive, and any baseline
-# already computed was computed on numbers that no longer exist.
+# window already pulled, with complete request intervals, means OpenAQ restated
+# its archive. Any baseline already computed then needs to be recomputed.
 
 
 def pm25_sensor(location_id: int, key: str) -> tuple[int, datetime, datetime] | None:
@@ -95,8 +96,13 @@ def measurements(sensor_id: int, start: datetime, end: datetime, key: str):
 
     Stops on a short page rather than trusting meta.found, which OpenAQ reports
     as a string like '>1000' once a result set is large enough to matter.
+
+    OpenAQ recomputes boundary buckets from the requested interval while keeping
+    the full hour's label: Ambala 21.2 became 19.8 when the request started 15
+    minutes later [measured 2026-10-03]. Only store periods inside the request;
+    low sensor coverage within an uncut period is a different condition.
     """
-    page = 1
+    page, clipped = 1, 0
     while True:
         payload = openaq_get(
             f"sensors/{sensor_id}/measurements/hourly", key,
@@ -107,10 +113,22 @@ def measurements(sensor_id: int, start: datetime, end: datetime, key: str):
         )
         results = payload.get("results", [])
         for row in results:
-            period = (row.get("period") or {}).get("datetimeFrom") or {}
-            if period.get("utc"):
-                yield _dt(period["utc"]), row.get("value")
+            period = row.get("period") or {}
+            first = (period.get("datetimeFrom") or {}).get("utc")
+            last = (period.get("datetimeTo") or {}).get("utc")
+            if not first or not last:
+                raise ValueError(f"sensor {sensor_id}: hourly period lacks UTC bounds")
+            hour_start, hour_end = _dt(first), _dt(last)
+            if hour_end - hour_start != timedelta(hours=1):
+                raise ValueError(f"sensor {sensor_id}: period is not one hour")
+            if hour_start < start or hour_end > end:
+                clipped += 1
+                continue
+            yield hour_start, row.get("value")
         if len(results) < PAGE_LIMIT:
+            if clipped:
+                print(f"    sensor {sensor_id}: {clipped} hour(s) skipped at "
+                      "request boundaries", file=sys.stderr)
             return
         page += 1
 
@@ -119,6 +137,12 @@ def usable(value) -> bool:
     return (isinstance(value, (int, float))
             and math.isfinite(value)
             and MIN_VALUE <= value <= MAX_VALUE)
+
+
+def resume_start(latest: datetime | None, now: datetime) -> datetime:
+    """Replay seven recent days, or resume further back after an interruption."""
+    recent = now - timedelta(days=7)
+    return min(recent, latest) if latest is not None else recent
 
 
 def backfill_station(cur, station_id: int, name: str, location_id: int,
@@ -162,7 +186,11 @@ def backfill_station(cur, station_id: int, name: str, location_id: int,
 def main() -> int:
     ap = argparse.ArgumentParser(description="Backfill OpenAQ hourly PM2.5.")
     ap.add_argument("--station", type=int, help="one station_id, else all mapped")
-    ap.add_argument("--since", help="ISO date, clamps the start of the window")
+    start = ap.add_mutually_exclusive_group()
+    start.add_argument("--since", help="ISO date, clamps the start of the window")
+    start.add_argument("--resume", action="store_true",
+                       help="replay seven days or resume from each station's "
+                            "last stored hour, whichever is earlier")
     ap.add_argument("--until", help="ISO date, clamps the end of the window")
     args = ap.parse_args()
 
@@ -186,11 +214,17 @@ def main() -> int:
                      f"mapped to OpenAQ. Run scripts/seed_stations.py first.")
 
         print(f"Backfilling {len(targets)} station(s) from OpenAQ hourly.")
+        now = datetime.now(timezone.utc)
         total, failures = 0, []
         for station_id, name, location_id in targets:
             try:
+                station_since = since
+                if args.resume:
+                    cur.execute("SELECT max(observation_ts) FROM pm25_history "
+                                "WHERE station_id = %s", (station_id,))
+                    station_since = resume_start(cur.fetchone()[0], now)
                 total += backfill_station(cur, station_id, name, location_id,
-                                          key, since, until)
+                                          key, station_since, until)
                 # Commit per station, so a failure at station 20 keeps the first
                 # 19 rather than discarding twenty minutes of throttled requests.
                 conn.commit()

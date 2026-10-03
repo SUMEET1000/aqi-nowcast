@@ -106,6 +106,9 @@ jobs:
         if: ${{ !inputs.fast }}
         run: pip install -r requirements-model.txt
 
+      - name: Check message safety
+        run: python tests/test_message.py
+
       # Same argument as ingest.yml's preflight: from outside the job, a missing
       # token and an unreachable database look identical, and the Actions log
       # download returns 403 without admin rights even on a public repo.
@@ -157,4 +160,6 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/check_send_window.py
+        run: |
+          python tests/test_send_window.py
+          python scripts/check_send_window.py

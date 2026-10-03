@@ -417,6 +417,44 @@ check("and the labels' hours match the windows themselves",
 print()
 
 
+print("A source outage cannot make old data or advice read as current:")
+outage_now = datetime(2026, 10, 3, 15, 30, tzinfo=timezone.utc)
+old_cpcb = datetime(2026, 9, 25, 13, 30, tzinfo=timezone.utc)
+old_dust = datetime(2026, 10, 2, 7, 30, tzinfo=timezone.utc)
+for lang in LANGS:
+    m = compose("S", {"PM2.5": 72.0, "PM10": 140.0, "NO2": 30.0},
+                old_cpcb, outage_now, PROFILE, pm25_ugm3=81.0,
+                concentration_ts=old_dust, lang=lang)
+    check(f"{lang}: stale AQI is not returned for sent_log",
+          (m.overall_aqi, m.band), (None, None))
+    check(f"{lang}: no government health quote survives an old bulletin",
+          any(note in m.text for note in ADVISORY.values()), False)
+    check(f"{lang}: the old dust reading's date is explicit",
+          "02/10/2026" in m.text, True)
+    check(f"{lang}: the old government bulletin's date is explicit",
+          "25/09/2026" in m.text, True)
+    check(f"{lang}: old air is described at its last reading",
+          TEXT[lang]["dust_band_old"].format(band="not good" if lang == "en"
+                                              else "अच्छी नहीं") in m.text, True)
+    check(f"{lang}: it does not call an old reading current",
+          "right now" in m.text if lang == "en" else "अभी हवा" in m.text, False)
+    fresh = compose("S", {"PM2.5": 72.0, "PM10": 140.0, "NO2": 30.0},
+                    old_cpcb, outage_now, PROFILE, pm25_ugm3=81.0,
+                    concentration_ts=datetime(2026, 10, 3, 14, 30,
+                                              tzinfo=timezone.utc), lang=lang)
+    check(f"{lang}: fresh dust cannot make an old government score usable",
+          (fresh.overall_aqi, fresh.band), (None, None))
+    check(f"{lang}: fresh dust cannot revive the old health note",
+          any(note in fresh.text for note in ADVISORY.values()), False)
+    check(f"{lang}: the fresh dust description remains current",
+          "right now" in fresh.text if lang == "en" else "अभी हवा" in fresh.text, True)
+
+boundary = compose("S", {"PM2.5": 72.0, "PM10": 140.0, "NO2": 30.0},
+                   datetime(2026, 10, 3, 3, 30, tzinfo=timezone.utc),
+                   outage_now, PROFILE)
+check("a government bulletin exactly 12 hours old remains usable",
+      boundary.overall_aqi, 140)
+
 print()
 if failures:
     sys.exit(f"FAILED — {failures} check(s). Do not send this to anyone.")

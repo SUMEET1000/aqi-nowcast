@@ -174,22 +174,19 @@ jobs:
       # skipped this archive pull since 09-25, although OpenAQ had newer data.
       # The earlier step still fails the job; neither source hides the other.
       #
-      # The window must stay WIDER THAN OPENAQ'S PUBLISHING LAG, or every run
-      # asks for hours that do not exist yet and backfill_station raises
-      # "requested window is outside sensor coverage" for all 30 stations. Two
-      # days was wide enough while the lag was ~7h; the lag reached ~4 days by
-      # 2026-09-07 and the step then failed on every run from 09-02, leaving
-      # pm25_history five days behind and reading as a dead pipeline. It cannot
-      # heal itself: the window slides forward faster than the data arrives.
-      # 7 costs ~5.5s per station, ~3 min for 30, against timeout-minutes: 20
-      # [measured 2026-09-07: backfill_openaq.py --station 15 --since 2026-08-31].
+      # Replay seven days for corrections, but start at a station's last stored
+      # hour if it is older. A fixed rolling window outran OpenAQ's publishing
+      # lag on 2026-09-02 and missed the beginning of the 09-25 outage by 10-03.
+      # The per-station watermark keeps those hours in the next request.
       - name: Pull OpenAQ hourly PM2.5
         if: ${{ !cancelled() }}
         env:
           PYTHONUNBUFFERED: "1"
           OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/backfill_openaq.py --since "$(date -u -d '7 days ago' +%F)"
+        run: |
+          python tests/test_backfill_resume.py
+          python scripts/backfill_openaq.py --resume
 
 # Two GitHub behaviours worth designing around rather than discovering later.
 # GitHub disables scheduled workflows on a repository with 60 days of no

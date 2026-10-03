@@ -131,11 +131,13 @@ def check_freshness(cur) -> None:
         SELECT max(run_ts),
                extract(epoch FROM now() - max(run_ts)) / 60
         FROM fetch_log
-        """
+        WHERE outcome = ANY(%s)
+        """,
+        (list(RUN_OUTCOMES),),
     )
     last_run, run_age_min = cur.fetchone()
     if last_run is None:
-        fail("fetch_log is empty — the ingester has never run")
+        fail("fetch_log has no ingester runs — the ingester has never run")
     elif run_age_min > MAX_RUN_AGE_MIN:
         fail(f"last run was {run_age_min / 60:.1f}h ago (limit "
              f"{MAX_RUN_AGE_MIN}min). The ingester is not running NOW, so the "

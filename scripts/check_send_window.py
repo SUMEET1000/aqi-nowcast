@@ -22,7 +22,6 @@ and names the replacement hour.
 
 import argparse
 import sys
-from collections import defaultdict
 from datetime import datetime, time, timedelta
 
 from cpcb_api import IST
@@ -74,23 +73,24 @@ def worst_age_at(hour: int, stamps: list[datetime], now: datetime
                  ) -> tuple[float | None, int]:
     """The worst age a message sent at `hour` IST would have carried.
 
-    Returns (worst age in hours, number of days that could be measured). A day
-    contributes only if that hour has already passed and at least one bulletin
-    exists at or before it — otherwise the day says nothing about this hour and
-    counting it as 0h would be a pass invented out of missing data.
+    Returns (worst age in hours, number of days that could be measured). Check
+    every calendar day from the first bulletin through now, using the newest
+    bulletin available at that send time, including one from an earlier day.
+    Before the first known bulletin or a future send, there is no measurement.
     """
     ist = [s.astimezone(IST) for s in stamps]
-    by_day: dict = defaultdict(list)
-    for s in ist:
-        by_day[s.date()].append(s)
+    if not ist:
+        return None, 0
 
     worst = None
     days = 0
-    for day, day_stamps in by_day.items():
+    day = min(s.date() for s in ist)
+    while day <= now.astimezone(IST).date():
         send_at = datetime.combine(day, time(hour), tzinfo=IST)
+        day += timedelta(days=1)
         if send_at > now:
             continue
-        earlier = [s for s in ist if s <= send_at and s.date() == day]
+        earlier = [s for s in ist if s <= send_at]
         if not earlier:
             continue
         age = (send_at - max(earlier)).total_seconds() / 3600
@@ -118,7 +118,7 @@ def main() -> int:
         sys.exit(f"no bulletins in the last {args.days} days — nothing to measure")
 
     span_days = len({s.astimezone(IST).date() for s in stamps})
-    print(f"check_send_window — {len(stamps)} bulletins across {span_days} IST day(s), "
+    print(f"check_send_window — {len(stamps)} bulletins across {span_days} stored IST day(s), "
           f"threshold {args.max_age_hours}h\n")
     print("  hour (IST)   days   worst age   clears?")
 
@@ -147,9 +147,9 @@ def main() -> int:
     if not clearing:
         sys.exit(f"FAIL — no hour in {CANDIDATE_HOURS.start:02d}:00-"
                  f"{CANDIDATE_HOURS.stop - 1:02d}:00 IST clears "
-                 f"{args.max_age_hours}h. CPCB's publishing schedule has changed "
-                 f"enough that no send time in this window produces a fresh "
-                 f"reading; re-measure the freeze before choosing one.")
+                 f"{args.max_age_hours}h. The feed may have stopped or its "
+                 f"publishing schedule changed. Check the newest bulletin "
+                 f"and collection failures before choosing a different hour.")
 
     latest = max(clearing)
     if SEND_HOUR not in clearing:

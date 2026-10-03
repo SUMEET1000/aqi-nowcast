@@ -169,6 +169,7 @@ TEXT = {
     "en": {
         "checked":   "Air checked at {t}",
         "dust_band": "Air is {band} right now",
+        "dust_band_old": "At the last reading, air was {band}",
         "dust":      "Fine dust in the air (PM2.5): <b>{v} µg/m³</b>",
         "dust_note": "Under 30 counts as clean air.",
         "warn":      ("⚠️ <b>Air is likely to get very bad around {t}.</b>\n"
@@ -180,6 +181,8 @@ TEXT = {
                       "full government AQI. The real AQI may be higher."),
         "no_score":  ("The government has not put out an AQI for this place "
                       "today. Only the dust number above is available."),
+        "old_score": ("The government AQI is from {t} and is too old to use. "
+                      "Its score and health note are withheld."),
         "age":       ("This reading is {h} hours old. Readings always reach "
                       "us a few hours late — this is normal."),
         "stale":     ("⚠️ Nothing new since {t} — {h} hours ago. That is much "
@@ -201,6 +204,7 @@ TEXT = {
     "hi": {
         "checked":   "हवा देखी गई: {t}",
         "dust_band": "अभी हवा {band} है",
+        "dust_band_old": "पिछली रीडिंग में हवा {band} थी",
         "dust":      "हवा में बारीक धूल (PM2.5): <b>{v} µg/m³</b>",
         "dust_note": "30 से कम मतलब साफ़ हवा।",
         "warn":      ("⚠️ <b>{t} के आसपास हवा बहुत खराब हो सकती है।</b>\n"
@@ -213,6 +217,8 @@ TEXT = {
                       "AQI नहीं है। असली AQI इससे ज़्यादा हो सकता है।"),
         "no_score":  ("सरकार ने आज इस जगह का AQI नहीं दिया है। सिर्फ़ ऊपर "
                       "वाला धूल का नंबर है।"),
+        "old_score": ("सरकारी AQI {t} का है और इस्तेमाल के लिए बहुत पुराना है। "
+                      "इसलिए उसका स्कोर और स्वास्थ्य सलाह नहीं दिखा रहे हैं।"),
         "age":       ("यह रीडिंग {h} घंटे पुरानी है। रीडिंग हमेशा कुछ घंटे "
                       "देर से पहुँचती है — यह आम बात है।"),
         "stale":     ("⚠️ {t} के बाद कुछ नया नहीं आया — {h} घंटे पहले। यह आम से "
@@ -328,7 +334,7 @@ def compose(station_name: str, readings: dict[str, float | None],
     morning — last bulletin 05:00 IST, next between 10:00 and 13:00 — while
     OpenAQ carries 06:00 to 09:00 IST. Measured 2026-08-19 across four stations.
 
-    Three paths, and the difference between them is not cosmetic:
+    Four paths, and the difference between them is not cosmetic:
 
     - Neither source has PM2.5 — the station's sensor is dark. Say so. Sending
       nothing would look like the bot broke, and Phase 1 measured six outages of
@@ -341,6 +347,8 @@ def compose(station_name: str, readings: dict[str, float | None],
       sentence is attached, because CPCB wrote every one of them against an
       overall band we do not have. The documented degraded wording says what
       the number is and that the official AQI may be higher.
+    - CPCB's bulletin is older than the staleness limit — withhold its score
+      and advisory even if OpenAQ has a newer concentration, and name the date.
 
     warn_target is the hour the promoted 12h model expects to exceed 121 µg/m³,
     or None when it does not, when no model is promoted, or when the station's
@@ -392,7 +400,11 @@ def compose(station_name: str, readings: dict[str, float | None],
 
     # %I is zero-padded ("05:00 AM"); Windows has no %-I, so strip by hand.
     def ist(ts: datetime) -> str:
-        return ts.astimezone(IST).strftime("%I:%M %p").lstrip("0")
+        local = ts.astimezone(IST)
+        clock = local.strftime("%I:%M %p").lstrip("0")
+        if (now - ts).total_seconds() / 3600 > STALE_AFTER_H:
+            return f"{local:%d/%m/%Y} {clock}"
+        return clock
 
     # Staleness is judged on the freshest thing we are showing. At the send
     # hour that is normally OpenAQ's reading rather than CPCB's bulletin, which
@@ -405,7 +417,8 @@ def compose(station_name: str, readings: dict[str, float | None],
 
     if pm25_ugm3 is not None:
         icon, word = plain[aqi.pm25_band(pm25_ugm3)]
-        lines += [f"{icon} <b>{t['dust_band'].format(band=word)}</b>",
+        band_text = t["dust_band_old" if age_h > STALE_AFTER_H else "dust_band"]
+        lines += [f"{icon} <b>{band_text.format(band=word)}</b>",
                   t["dust"].format(v=f"{pm25_ugm3:.0f}"),
                   t["dust_note"], ""]
 
@@ -421,7 +434,9 @@ def compose(station_name: str, readings: dict[str, float | None],
             lines += [t["win_clean"].format(w=names[cleanest]),
                       t["win_worst"].format(w=names[worst]), ""]
 
-    overall, refusal = aqi.overall_aqi(readings)
+    old_bulletin = (observation_ts is not None and
+                    (now - observation_ts).total_seconds() / 3600 > STALE_AFTER_H)
+    overall, refusal = aqi.overall_aqi({} if old_bulletin else readings)
     if overall is not None:
         lines += [
             t["score"].format(aqi=overall.aqi, band=plain[overall.band][1]),
@@ -434,6 +449,8 @@ def compose(station_name: str, readings: dict[str, float | None],
             f"“{aqi.ADVISORY[overall.band]}”",
             f"— {aqi.ADVISORY_CITATION}",
         ]
+    elif old_bulletin:
+        lines += [t["old_score"].format(t=ist(observation_ts))]
     elif pm25 is not None:
         # Our own wording, and deliberately so: it describes what our number is
         # and is not, which is not something CPCB has published a sentence for.
