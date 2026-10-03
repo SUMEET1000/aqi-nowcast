@@ -164,14 +164,15 @@ jobs:
       # OpenAQ carries the same CPCB sensors as real µg/m³, and the live feed
       # does not: measured 2026-08-19, observations.value_avg is CPCB's AQI
       # sub-index, so without this step the product has no concentration to
-      # report at all. It is also the fresher source at send time — CPCB freezes
-      # between 05:00 and about 11:00 IST while OpenAQ keeps publishing 06:00 to
-      # 09:00, which is exactly when the 07:00 alert goes out.
+      # report at all.
       #
       # After Ingest, not before: CPCB's bulletin is the unrecoverable one, and
       # a failure here must not cost it. OpenAQ is an archive that is still
       # there on the next run, which is also why a window of days rather than
       # one hour — a missed run heals itself instead of leaving a hole.
+      # Run after a CPCB failure too: on 2026-10-03 the failed Ingest step had
+      # skipped this archive pull since 09-25, although OpenAQ had newer data.
+      # The earlier step still fails the job; neither source hides the other.
       #
       # The window must stay WIDER THAN OPENAQ'S PUBLISHING LAG, or every run
       # asks for hours that do not exist yet and backfill_station raises
@@ -183,6 +184,7 @@ jobs:
       # 7 costs ~5.5s per station, ~3 min for 30, against timeout-minutes: 20
       # [measured 2026-09-07: backfill_openaq.py --station 15 --since 2026-08-31].
       - name: Pull OpenAQ hourly PM2.5
+        if: ${{ !cancelled() }}
         env:
           PYTHONUNBUFFERED: "1"
           OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
